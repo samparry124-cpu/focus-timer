@@ -16,6 +16,14 @@ BREAKS
   included). When the break runs out, the lock comes back on by itself and
   Chrome jumps back to your study tab.
 
+REST STOPWATCH
+  "Rest" on the home screen hides the app and floats a small stopwatch on top
+  of everything (e.g. a game in windowed / borderless mode). It counts up,
+  can be paused (showing how long it has been paused), and shows today's rest
+  next to today's focus. The ring turns amber after 30 min and red after
+  60 min. Clicking it doesn't take focus from the game; drag it anywhere.
+  Stop returns to the home screen.
+
 SPOTIFY
   With "Spotify controls" on, a card next to the timer shows what the Spotify
   desktop app is playing, with back / play-pause / skip buttons. It reads the
@@ -86,6 +94,8 @@ PRESETS = [15, 25, 45, 60]
 BREAK_COUNTS = [0, 1, 2, 3]
 BREAK_MINUTES = [2, 3, 5, 10, 15, 20, 30]
 STREAK_MIN_SECONDS = 5 * 60      # a day counts towards the streak after 5 focused minutes
+REST_WARN_SECONDS = 30 * 60      # rest stopwatch turns amber...
+REST_BAD_SECONDS = 60 * 60       # ...then red
 
 _SCALE = 1.0                     # set from the screen DPI when the app starts
 
@@ -105,7 +115,8 @@ EXT_DIR = os.path.join(_LOCAL, "FocusLock", "extension")
 SOUND_DIR = os.path.join(_LOCAL, "FocusLock", "sounds")
 
 DEFAULTS = {"minutes": "25", "mode": "full", "locktab": True, "exact": True,
-            "apps": [], "extra": "", "breaks": 1, "break_minutes": 5, "spotify": True}
+            "apps": [], "extra": "", "breaks": 1, "break_minutes": 5, "spotify": True,
+            "rest_pos": None}
 
 
 def parse_exes(text):
@@ -161,26 +172,37 @@ def save_settings(s):
 # ---- Focus history (today / week / streak) ---------------------------------
 class Stats:
     def __init__(self):
-        self.days = {}
+        self.days = {}               # focus seconds per day
+        self.rest = {}               # rest-stopwatch seconds per day
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for k, v in data.get("days", {}).items():
-                self.days[str(k)] = float(v)
+            for name, target in (("days", self.days), ("rest", self.rest)):
+                for k, v in data.get(name, {}).items():
+                    target[str(k)] = float(v)
         except (OSError, ValueError, AttributeError, TypeError):
             pass
 
-    def add(self, seconds):
+    def _add(self, table, seconds):
         key = datetime.date.today().isoformat()
-        self.days[key] = self.days.get(key, 0.0) + max(0.0, seconds)
+        table[key] = table.get(key, 0.0) + max(0.0, seconds)
         try:
             os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
             tmp = STATS_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"days": self.days}, f)
+                json.dump({"days": self.days, "rest": self.rest}, f)
             os.replace(tmp, STATS_FILE)
         except OSError:
             pass
+
+    def add(self, seconds):
+        self._add(self.days, seconds)
+
+    def add_rest(self, seconds):
+        self._add(self.rest, seconds)
+
+    def rest_today(self):
+        return self.rest.get(datetime.date.today().isoformat(), 0.0)
 
     def on(self, day):
         return self.days.get(day.isoformat(), 0.0)
@@ -227,6 +249,14 @@ def fmt_duration(secs):
     return "%dh %02dm" % (m // 60, m % 60)
 
 
+def fmt_elapsed(secs):
+    secs = int(max(0.0, secs))
+    h, rest = divmod(secs, 3600)
+    if h:
+        return "%d:%02d:%02d" % (h, rest // 60, rest % 60)
+    return "%02d:%02d" % (rest // 60, rest % 60)
+
+
 def fmt_clock(secs):
     secs = int(math.ceil(max(0.0, secs) - 1e-6))
     h, rest = divmod(secs, 3600)
@@ -267,6 +297,8 @@ SW_SHOW, SW_MINIMIZE, SW_RESTORE = 5, 6, 9
 DWMWA_CLOAKED = 14
 ERROR_ALREADY_EXISTS = 183
 WM_APPCOMMAND = 0x319
+HWND_TOPMOST = -1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
 # action -> (APPCOMMAND_* sent to Spotify's window, media key used as a fallback)
 SPOTIFY_ACTIONS = {"next": (11, 0xB0), "prev": (12, 0xB1), "toggle": (14, 0xB3)}
@@ -318,6 +350,10 @@ if IS_WINDOWS:
     _sig(user32.GetClassNameW, [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
     _sig(user32.GetWindowLongW, [wintypes.HWND, ctypes.c_int], ctypes.c_long)
     _sig(user32.ShowWindowAsync, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+    _sig(user32.SetWindowLongW, [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long)
+    _sig(user32.SetWindowPos,
+         [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+          wintypes.UINT], wintypes.BOOL)
     _sig(user32.ShowWindow, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
     _sig(user32.PostMessageW,
          [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL)
@@ -430,6 +466,16 @@ if IS_WINDOWS:
     def minimize_window(hwnd):
         user32.ShowWindowAsync(hwnd, SW_MINIMIZE)
 
+    def make_overlay(hwnd):
+        """Clicking the window won't take focus from a game; no taskbar button."""
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+
+    def keep_on_top(hwnd):
+        """Re-assert always-on-top without activating (games can push themselves above)."""
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
     def find_spotify_window():
         """(hwnd, title) of the Spotify desktop app's main window, or (None, '').
         Hidden windows count too, so it still works when Spotify sits in the tray."""
@@ -486,6 +532,8 @@ else:  # lets the logic be imported/tested off-Windows
     def list_app_windows(exclude_pids=(), include_minimized=False): return []
     def minimize_window(hwnd): pass
     def find_spotify_window(): return None, ""
+    def make_overlay(hwnd): pass
+    def keep_on_top(hwnd): pass
     def spotify_send(hwnd, action, use_keys=False): pass
     def launch_spotify(): return False
 
@@ -514,8 +562,9 @@ def activate_existing_instance():
     hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE) or user32.FindWindowW(None, APP_TITLE)
     if not hwnd:
         return False
-    user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
-    user32.SetForegroundWindow(hwnd)
+    if user32.IsWindowVisible(hwnd):    # hidden while the rest stopwatch floats on its own
+        user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
+        user32.SetForegroundWindow(hwnd)
     return True
 
 
@@ -2027,6 +2076,161 @@ class SpotifyCard(tk.Canvas):
                 self.create_rectangle(bx, cy - s, bx + px(2), cy + s, fill=ink, outline="")
 
 
+def rest_color(elapsed):
+    if elapsed >= REST_BAD_SECONDS:
+        return DANGER
+    if elapsed >= REST_WARN_SECONDS:
+        return WARN
+    return GOOD
+
+
+class RestOverlay(tk.Toplevel):
+    """Small always-on-top stopwatch pill that floats over games. Drag it anywhere."""
+
+    KEY = "#010203"          # painted where the window is see-through (rounded corners)
+
+    def __init__(self, master, on_toggle, on_stop, on_moved):
+        super().__init__(master)
+        self.on_toggle, self.on_stop, self.on_moved = on_toggle, on_stop, on_moved
+        self.overrideredirect(True)
+        self.title(APP_TITLE + " - rest")
+        self.configure(bg=self.KEY)
+        for name, value in (("-topmost", True), ("-alpha", 0.95), ("-transparentcolor", self.KEY)):
+            try:
+                self.attributes(name, value)
+            except tk.TclError:
+                pass
+        self.W, self.H = px(372), px(84)
+        self.cv = tk.Canvas(self, width=self.W, height=self.H, bg=self.KEY,
+                            highlightthickness=0, bd=0)
+        self.cv.pack()
+        self.f_time = bold(20)
+        self.f_tag = bold(7)
+        self.f_sub = tkfont.Font(family=FONT, size=9)
+        self.hover = None
+        self.hits = {}
+        self.state = None
+        self._drag = None
+        self._press = None
+        self.cv.bind("<Motion>", self._motion)
+        self.cv.bind("<Leave>", lambda e: self._set_hover(None))
+        self.cv.bind("<ButtonPress-1>", self._down)
+        self.cv.bind("<B1-Motion>", self._dragging)
+        self.cv.bind("<ButtonRelease-1>", self._up)
+
+    def hwnd(self):
+        try:
+            return int(self.wm_frame(), 16)
+        except (tk.TclError, ValueError):
+            return None
+
+    # ---- mouse: buttons + drag to move -------------------------------------
+    def _hit(self, x, y):
+        for name, (x1, y1, x2, y2) in self.hits.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return name
+        return None
+
+    def _set_hover(self, name):
+        if name != self.hover:
+            self.hover = name
+            self._draw()
+
+    def _motion(self, e):
+        name = self._hit(e.x, e.y)
+        self.cv.configure(cursor="hand2" if name else "fleur")
+        self._set_hover(name)
+
+    def _down(self, e):
+        self._press = self._hit(e.x, e.y)
+        if not self._press:
+            self._drag = (e.x_root - self.winfo_x(), e.y_root - self.winfo_y())
+
+    def _dragging(self, e):
+        if self._drag:
+            self.geometry("+%d+%d" % (e.x_root - self._drag[0], e.y_root - self._drag[1]))
+
+    def _up(self, e):
+        if self._drag:
+            self._drag = None
+            self.on_moved(self.winfo_x(), self.winfo_y())
+            return
+        name, self._press = self._press, None
+        if name and name == self._hit(e.x, e.y):
+            (self.on_toggle if name == "toggle" else self.on_stop)()
+
+    # ---- drawing ------------------------------------------------------------
+    def show(self, elapsed, paused, sub, sub_color):
+        state = (fmt_elapsed(elapsed), paused, sub, sub_color, rest_color(elapsed),
+                 int(elapsed % 3600 // 30))
+        if state != self.state:
+            self.state = state
+            self._elapsed = elapsed
+            self._draw()
+
+    def _fit(self, text, font, width):
+        if font.measure(text) <= width:
+            return text
+        while text and font.measure(text + "…") > width:
+            text = text[:-1]
+        return text.rstrip() + "…"
+
+    def _draw(self):
+        if not self.state:
+            return
+        text, paused, sub, sub_color, level, _ = self.state
+        cv, W, H = self.cv, self.W, self.H
+        cv.delete("all")
+        self.hits = {}
+        round_rect(cv, 0, 0, W - 1, H - 1, H / 2.0, fill=BG, outline=BORDER)
+
+        # clock ring: sweeps once an hour, colour shows how long this rest has run
+        color = MUTED if paused else level
+        cx = cy = H / 2.0
+        outer = H / 2.0 - px(11)
+        for i in range(12):
+            a = math.radians(90 - 30 * i)
+            lit = i < math.ceil((self._elapsed % 3600) / 300.0 - 1e-9)
+            cv.create_line(cx + outer * math.cos(a), cy - outer * math.sin(a),
+                           cx + (outer - px(4)) * math.cos(a), cy - (outer - px(4)) * math.sin(a),
+                           fill=color if lit else "#334155", width=max(1, px(1.5)), capstyle="round")
+        rr, th = outer - px(9), px(5)
+        cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=PANEL, width=th)
+        frac = (self._elapsed % 3600) / 3600.0
+        if self._elapsed >= 3600 and frac < 0.002:
+            frac = 1.0
+        if frac > 0.002:
+            cv.create_arc(cx - rr, cy - rr, cx + rr, cy + rr, start=90,
+                          extent=-min(359.99, 360 * frac), style="arc", outline=color, width=th)
+        cv.create_text(cx, cy, text="PAUSED" if paused else "REST", font=self.f_tag, fill=color)
+
+        # time + reminder line
+        x0 = H + px(2)
+        cv.create_text(x0, cy - px(9), anchor="w", text=text, font=self.f_time,
+                       fill=MUTED if paused else FG)
+        bx = W - px(30) - px(42) - px(17)
+        cv.create_text(x0, cy + px(17), anchor="w", font=self.f_sub, fill=sub_color,
+                       text=self._fit(sub, self.f_sub, bx - x0 - px(6)))
+
+        # buttons: pause/resume, stop
+        d = px(34)
+        for name, bcx in (("toggle", W - px(30) - px(42)), ("stop", W - px(30))):
+            hov = self.hover == name
+            fill = (DANGER if name == "stop" else PANEL_HI) if hov else PANEL
+            cv.create_oval(bcx - d / 2, cy - d / 2, bcx + d / 2, cy + d / 2, fill=fill, outline="")
+            self.hits[name] = (bcx - d / 2, cy - d / 2, bcx + d / 2, cy + d / 2)
+            ink = INK if (hov and name == "stop") else FG
+            s = px(5.5)
+            if name == "stop":
+                round_rect(cv, bcx - s, cy - s, bcx + s, cy + s, px(2), fill=ink, outline=ink)
+            elif paused:
+                cv.create_polygon(bcx - s * 0.6, cy - s * 1.05, bcx - s * 0.6, cy + s * 1.05,
+                                  bcx + s * 1.05, cy, fill=ink, outline="")
+            else:
+                for x in (bcx - px(5), bcx + px(2)):
+                    cv.create_rectangle(x, cy - s, x + px(3), cy + s, fill=ink, outline="")
+
+
 def section(parent, text, pady=(16, 7)):
     lab = tk.Label(parent, text=text.upper(), bg=parent["bg"], fg=SUBTLE, font=(FONT, 8, "bold"))
     lab.pack(anchor="w", pady=(px(pady[0]), px(pady[1])))
@@ -2083,6 +2287,11 @@ class FocusLock(tk.Tk):
         self.spotify = SpotifyWatcher()
         self.spotify_on = False
         self.spotify_card = None
+        self.rest_win = None
+        self.rest_elapsed = 0.0         # stopwatch seconds before the current run
+        self.rest_run = None            # monotonic start of the current run (None = paused)
+        self.rest_paused_at = None
+        self.rest_seg = None            # monotonic start of rest time not yet saved
 
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(expand=True, fill="both")
@@ -2119,6 +2328,7 @@ class FocusLock(tk.Tk):
     def shutdown(self):
         try:
             self.credit_focus(stop=True)
+            self.credit_rest(stop=True)
             self.blocker.stop()
             self.tabsrv.end()
         except Exception:
@@ -2326,7 +2536,11 @@ class FocusLock(tk.Tk):
         bottom = tk.Frame(outer, bg=BG)
         bottom.pack(fill="x", pady=(px(22), 0))
         self.start_btn = RoundButton(bottom, "Start focus", self.start, size=12, pady=11)
-        self.start_btn.pack(fill="x")
+        self.start_btn.pack(side="left", fill="both", expand=True)
+        rest = self.stats.rest_today()
+        RoundButton(bottom, "Rest  \u00b7  %s today" % fmt_duration(rest) if rest >= 60
+                    else "Rest stopwatch", self.start_rest, kind="secondary", size=11,
+                    pady=12).pack(side="left", fill="y", padx=(px(10), 0))
         msg = tk.Frame(outer, bg=BG)
         msg.pack(fill="x", pady=(px(10), 0))
         self.msg_lbl = label(msg, "", 10, DANGER, wraplength=W - px(150), justify="left")
@@ -2494,13 +2708,13 @@ class FocusLock(tk.Tk):
                 self.set_message("Study mode needs at least one allowed app, or a locked Chrome tab.")
                 return
 
-        self.settings = {"minutes": self.minutes_var.get().strip(), "mode": mode,
+        self.settings.update({"minutes": self.minutes_var.get().strip(), "mode": mode,
                          "locktab": bool(self.locktab_var.get()),
                          "exact": bool(self.exact_var.get()),
                          "apps": apps, "extra": extra,
                          "breaks": self.breaks_var.get(),
                          "break_minutes": self.break_min_var.get(),
-                         "spotify": bool(self.spotify_var.get())}
+                         "spotify": bool(self.spotify_var.get())})
         save_settings(self.settings)
 
         params = {"minutes": minutes, "mode": mode, "allowed": allowed, "lock_tab": lock_tab,
@@ -2956,6 +3170,118 @@ class FocusLock(tk.Tk):
         RoundButton(row, "Close", self.on_close, kind="secondary", size=11).pack(side="left", padx=px(5))
         self.bind("<Return>", lambda e: self.show_setup() if self.phase == "done" else None)
         self.center_on_primary()
+
+    # ---- rest stopwatch ----------------------------------------------------
+    def start_rest(self):
+        """Hide the app and float a count-up stopwatch on top of everything (e.g. a game)."""
+        if self.phase != "setup":
+            return
+        gen = self.new_phase("rest")
+        self.clear()
+        self.withdraw()
+        now = time.monotonic()
+        self.rest_elapsed, self.rest_run, self.rest_paused_at, self.rest_seg = 0.0, now, None, now
+        win = self.rest_win = RestOverlay(self, self.toggle_rest, self.stop_rest, self._rest_moved)
+        win.update_idletasks()
+        x, y = self._rest_position(win)
+        win.geometry("+%d+%d" % (x, y))
+        win.update_idletasks()
+        hwnd = win.hwnd()
+        if hwnd:
+            try:
+                make_overlay(hwnd)
+            except Exception:
+                pass
+        self.rest_tick(gen)
+        self.rest_keep_on_top(gen)
+
+    def _rest_position(self, win):
+        px_, py_, pw, ph = self.primary_monitor()
+        default = (px_ + pw - win.W - px(24), py_ + px(24))
+        pos = self.settings.get("rest_pos")
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
+            return default
+        x, y = int(pos[0]), int(pos[1])
+        screens = get_monitors() or [(px_, py_, pw, ph)]
+        for mx, my, mw, mh in screens:                 # still on a connected screen?
+            if mx <= x + win.W // 2 < mx + mw and my <= y + win.H // 2 < my + mh:
+                return x, y
+        return default
+
+    def _rest_moved(self, x, y):
+        self.settings["rest_pos"] = [x, y]
+        save_settings(self.settings)
+
+    def rest_now(self):
+        if self.rest_run is None:
+            return self.rest_elapsed
+        return self.rest_elapsed + time.monotonic() - self.rest_run
+
+    def credit_rest(self, stop=False):
+        if self.rest_seg is None:
+            return
+        now = time.monotonic()
+        secs = now - self.rest_seg
+        self.rest_seg = None if stop else now
+        if secs > 0:
+            self.stats.add_rest(secs)
+
+    def toggle_rest(self):
+        now = time.monotonic()
+        if self.rest_run is not None:                  # pause
+            self.credit_rest(stop=True)
+            self.rest_elapsed += now - self.rest_run
+            self.rest_run, self.rest_paused_at = None, now
+        else:                                          # resume
+            self.rest_run, self.rest_seg, self.rest_paused_at = now, now, None
+        self.rest_tick(self.gen, once=True)
+
+    def stop_rest(self):
+        if self.phase != "rest":
+            return
+        self.credit_rest(stop=True)
+        self.rest_run = None
+        if self.rest_win is not None:
+            self.rest_win.destroy()
+            self.rest_win = None
+        self.deiconify()
+        self.show_setup()
+
+    def rest_tick(self, gen, once=False):
+        if gen != self.gen or self.rest_win is None:
+            return
+        now = time.monotonic()
+        running = self.rest_run is not None
+        if running and now - self.rest_seg >= 30:
+            self.credit_rest()                         # save progress regularly
+        if running:
+            rest_today = self.stats.rest_today() + (now - self.rest_seg)
+            focus_today = self.stats.today()
+            sub = "Today: %s rest  ·  %s focus" % (fmt_duration(rest_today),
+                                                         fmt_duration(focus_today))
+            sub_color = WARN if rest_today > focus_today else MUTED
+        else:
+            sub = "Paused for %s" % fmt_elapsed(now - self.rest_paused_at)
+            sub_color = WARN
+        try:
+            self.rest_win.show(self.rest_now(), not running, sub, sub_color)
+        except tk.TclError:
+            return
+        if not once:
+            self.after(250, self.rest_tick, gen)
+
+    def rest_keep_on_top(self, gen):
+        if gen != self.gen or self.rest_win is None:
+            return
+        hwnd = self.rest_win.hwnd()
+        try:
+            if hwnd and IS_WINDOWS:
+                keep_on_top(hwnd)
+            else:
+                self.rest_win.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.after(1000, self.rest_keep_on_top, gen)
 
 
 def main():

@@ -1,14 +1,20 @@
 """
-Focus Lock v3 - a Windows study timer that is hard to escape.
+Focus Lock v4 - a Windows study timer that is hard to escape.
 
 Run:   python focus_lock.py          (Windows, Python 3.8+, no extra installs)
 
 TWO MODES
-  Full lock   Black screen + big timer on EVERY monitor. Nothing else usable.
-              Blocks Win key, Alt+Tab, Alt+Esc, Ctrl+Esc.
+  Full lock   Black screen + clock-style timer on EVERY monitor. Nothing else
+              usable. Blocks Win key, Alt+Tab, Alt+Esc, Ctrl+Esc.
   Study mode  Only the apps you allow stay usable; everything else is
               minimised the moment it appears. Blocks the Win key (Alt+Tab
               still works so you can hop between allowed apps).
+
+BREAKS
+  Before starting, choose 0-3 breaks and how long each one is. During a
+  session, "Take a break" freezes the timer and unlocks everything (Chrome
+  included). When the break runs out, the lock comes back on by itself and
+  Chrome jumps back to your study tab.
 
 CHROME TAB LOCK (Study mode)
   1. Open the page you want to study in your normal Chrome.
@@ -16,9 +22,11 @@ CHROME TAB LOCK (Study mode)
        - no new tabs or windows (they are closed instantly),
        - the tab's address can't be changed (you get bounced straight back),
        - you can't switch to any other tab or Chrome window,
-       - closing the tab just reopens it.
-  This needs a small companion extension. Click "Install Chrome extension..."
-  once in the app - it writes the extension files and walks you through it.
+       - closing the tab (or Chrome's last window) just reopens it.
+  This needs a small companion extension. Click "Install extension" once in
+  the app - it writes the extension files and walks you through it. The
+  extension must be allowed in Incognito, otherwise a private window would be
+  a way around the lock. The start screen shows whether it is connected.
 
 EMERGENCY EXITS (deliberately left open so you can never be trapped)
   - Click "End early" and type the phrase.
@@ -29,48 +37,106 @@ EMERGENCY EXITS (deliberately left open so you can never be trapped)
 """
 
 import atexit
+import datetime
 import json
+import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WINDOWS = sys.platform == "win32"
+APP_TITLE = "Focus Lock"
 
 # ---- Look & feel -----------------------------------------------------------
-BG = "#0f172a"
+BG = "#0b1120"
+SURFACE = "#111a2d"
 PANEL = "#1e293b"
+PANEL_HI = "#283548"
+BORDER = "#24324a"
 FG = "#e2e8f0"
-MUTED = "#64748b"
+MUTED = "#94a3b8"
+SUBTLE = "#64748b"
 ACCENT = "#38bdf8"
+ACCENT_HI = "#7dd3fc"
 GOOD = "#4ade80"
+WARN = "#fbbf24"
+WARN_HI = "#fcd34d"
 DANGER = "#f87171"
+INK = "#0b1120"          # text on bright fills
 FONT = "Segoe UI"
 
 QUIT_PHRASE = "i am choosing to be distracted"
 PRESETS = [15, 25, 45, 60]
+BREAK_COUNTS = [0, 1, 2, 3]
+BREAK_MINUTES = [2, 3, 5, 10, 15, 20, 30]
+STREAK_MIN_SECONDS = 5 * 60      # a day counts towards the streak after 5 focused minutes
+
+_SCALE = 1.0                     # set from the screen DPI when the app starts
+
+
+def px(n):
+    """Scale a design-pixel value to the current DPI."""
+    return int(round(n * _SCALE))
+
 
 # ---- Paths / settings ------------------------------------------------------
 TAB_PORT = 9334
 _APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
 _LOCAL = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 SETTINGS_FILE = os.path.join(_APPDATA, "FocusLock", "settings.json")
+STATS_FILE = os.path.join(_APPDATA, "FocusLock", "stats.json")
 EXT_DIR = os.path.join(_LOCAL, "FocusLock", "extension")
+SOUND_DIR = os.path.join(_LOCAL, "FocusLock", "sounds")
 
-DEFAULTS = {"minutes": "25", "mode": "full", "locktab": True, "exact": True, "extra": ""}
+DEFAULTS = {"minutes": "25", "mode": "full", "locktab": True, "exact": True,
+            "apps": [], "extra": "", "breaks": 1, "break_minutes": 5}
+
+
+def parse_exes(text):
+    out = set()
+    for tok in text.replace(";", ",").replace("\n", ",").split(","):
+        tok = tok.strip().lower()
+        if tok:
+            out.add(tok if "." in tok else tok + ".exe")
+    return out
+
+
+def _nearest(value, choices):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return choices[0]
+    return min(choices, key=lambda c: abs(c - value))
 
 
 def load_settings():
     s = dict(DEFAULTS)
+    raw = {}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            s.update(json.load(f))
+            raw = json.load(f)
     except (OSError, ValueError):
         pass
+    if isinstance(raw, dict):
+        s.update(raw)
+        if raw and "apps" not in raw:
+            # v3 saved the ticked apps into the "extra" text box, so un-ticking
+            # them never took effect. Move them back into the list.
+            s["apps"] = sorted(parse_exes(str(raw.get("extra", ""))))
+            s["extra"] = ""
+    if not isinstance(s["apps"], list):
+        s["apps"] = []
+    s["apps"] = [str(a).lower() for a in s["apps"] if a]
+    s["breaks"] = _nearest(s.get("breaks"), BREAK_COUNTS)
+    s["break_minutes"] = _nearest(s.get("break_minutes"), BREAK_MINUTES)
     return s
 
 
@@ -81,6 +147,87 @@ def save_settings(s):
             json.dump(s, f)
     except OSError:
         pass
+
+
+# ---- Focus history (today / week / streak) ---------------------------------
+class Stats:
+    def __init__(self):
+        self.days = {}
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("days", {}).items():
+                self.days[str(k)] = float(v)
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+
+    def add(self, seconds):
+        key = datetime.date.today().isoformat()
+        self.days[key] = self.days.get(key, 0.0) + max(0.0, seconds)
+        try:
+            os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+            tmp = STATS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"days": self.days}, f)
+            os.replace(tmp, STATS_FILE)
+        except OSError:
+            pass
+
+    def on(self, day):
+        return self.days.get(day.isoformat(), 0.0)
+
+    def today(self):
+        return self.on(datetime.date.today())
+
+    def week(self):
+        d = datetime.date.today()
+        return sum(self.on(d - datetime.timedelta(days=i)) for i in range(7))
+
+    def last7(self):
+        """Booleans for the last 7 days (oldest first): did the day count?"""
+        d = datetime.date.today()
+        return [self.on(d - datetime.timedelta(days=i)) >= STREAK_MIN_SECONDS
+                for i in range(6, -1, -1)]
+
+    def streak(self):
+        d = datetime.date.today()
+        if self.on(d) < STREAK_MIN_SECONDS:      # today not done yet - keep yesterday's streak
+            d -= datetime.timedelta(days=1)
+        n = 0
+        while self.on(d) >= STREAK_MIN_SECONDS:
+            n += 1
+            d -= datetime.timedelta(days=1)
+        return n
+
+    def best_streak(self):
+        good = sorted(datetime.date.fromisoformat(k) for k, v in self.days.items()
+                      if v >= STREAK_MIN_SECONDS)
+        best = run = 0
+        prev = None
+        for d in good:
+            run = run + 1 if prev and (d - prev).days == 1 else 1
+            best = max(best, run)
+            prev = d
+        return best
+
+
+def fmt_duration(secs):
+    m = int(secs // 60)
+    if m < 60:
+        return "%dm" % m
+    return "%dh %02dm" % (m // 60, m % 60)
+
+
+def fmt_clock(secs):
+    secs = int(math.ceil(max(0.0, secs) - 1e-6))
+    h, rest = divmod(secs, 3600)
+    if h:
+        return "%d:%02d:%02d" % (h, rest // 60, rest % 60)
+    return "%02d:%02d" % (rest // 60, rest % 60)
+
+
+def plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
 # ---- Windows that are never touched in Study mode --------------------------
@@ -107,8 +254,9 @@ WM_QUIT = 0x12
 KEY_MESSAGES = (0x100, 0x101, 0x104, 0x105)  # key down/up, syskey down/up
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE = 0x80, 0x40000, 0x08000000
-SW_MINIMIZE = 6
+SW_SHOW, SW_MINIMIZE, SW_RESTORE = 5, 6, 9
 DWMWA_CLOAKED = 14
+ERROR_ALREADY_EXISTS = 183
 
 if IS_WINDOWS:
     import ctypes
@@ -157,6 +305,11 @@ if IS_WINDOWS:
     _sig(user32.GetClassNameW, [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
     _sig(user32.GetWindowLongW, [wintypes.HWND, ctypes.c_int], ctypes.c_long)
     _sig(user32.ShowWindowAsync, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+    _sig(user32.ShowWindow, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+    _sig(user32.SetForegroundWindow, [wintypes.HWND], wintypes.BOOL)
+    _sig(user32.FindWindowW, [wintypes.LPCWSTR, wintypes.LPCWSTR], wintypes.HWND)
+    _sig(user32.MessageBoxW,
+         [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT], ctypes.c_int)
     _sig(user32.EnumDisplayMonitors,
          [wintypes.HDC, ctypes.POINTER(wintypes.RECT), MONITORENUMPROC, wintypes.LPARAM],
          wintypes.BOOL)
@@ -167,6 +320,8 @@ if IS_WINDOWS:
          [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)],
          wintypes.BOOL)
     _sig(kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL)
+    _sig(kernel32.CreateMutexW, [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR],
+         wintypes.HANDLE)
     _sig(dwmapi.DwmGetWindowAttribute,
          [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD], ctypes.c_long)
 
@@ -267,6 +422,35 @@ else:  # lets the logic be imported/tested off-Windows
     def minimize_window(hwnd): pass
 
 
+# ---- Only one copy at a time -----------------------------------------------
+_instance_mutex = None
+
+
+def acquire_single_instance():
+    """True if we are the only Focus Lock running (keeps a named mutex open)."""
+    global _instance_mutex
+    if not IS_WINDOWS:
+        return True
+    h = kernel32.CreateMutexW(None, False, "Local\\FocusLock.SingleInstance")
+    err = ctypes.get_last_error()
+    if not h:
+        return True                     # can't tell - don't lock the user out
+    if err == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(h)
+        return False
+    _instance_mutex = h
+    return True
+
+
+def activate_existing_instance():
+    hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE) or user32.FindWindowW(None, APP_TITLE)
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
+    user32.SetForegroundWindow(hwnd)
+    return True
+
+
 # ============================================================================
 #  Keyboard blocker (low-level hook on its own thread)
 # ============================================================================
@@ -340,6 +524,61 @@ class KeyBlocker:
 
 
 # ============================================================================
+#  Chime (played on a worker thread so the UI never stalls)
+# ============================================================================
+CHIMES = {
+    "done": [(659.25, 0.00), (880.00, 0.16), (1108.73, 0.32)],    # E5 A5 C#6, rising
+    "resume": [(880.00, 0.00), (659.25, 0.18)],                    # A5 E5, back to work
+}
+
+
+def _chime_file(kind):
+    path = os.path.join(SOUND_DIR, "chime-%s.wav" % kind)
+    if os.path.isfile(path):
+        return path
+    rate, ring = 22050, 1.1
+    notes = CHIMES[kind]
+    n = int(rate * (notes[-1][1] + ring))
+    buf = [0.0] * n
+    for freq, start in notes:
+        s0 = int(start * rate)
+        w = 2 * math.pi * freq / rate
+        for i in range(min(int(rate * ring), n - s0)):
+            t = i / rate
+            env = min(1.0, t / 0.006) * math.exp(-t * 4.2)
+            buf[s0 + i] += env * (math.sin(w * i) + 0.3 * math.sin(2 * w * i))
+    peak = max(abs(x) for x in buf) or 1.0
+    data = struct.pack("<%dh" % n, *(int(x / peak * 0.55 * 32767) for x in buf))
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with wave.open(tmp, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(data)
+    os.replace(tmp, path)
+    return path
+
+
+def play_chime(kind):
+    def run():
+        try:
+            import winsound
+        except ImportError:
+            return
+        try:
+            winsound.PlaySound(_chime_file(kind),
+                               winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+        except Exception:
+            try:
+                winsound.MessageBeep()
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ============================================================================
 #  Local API that the Chrome extension polls
 # ============================================================================
 def find_chrome():
@@ -354,60 +593,79 @@ def find_chrome():
     return shutil.which("chrome")
 
 
-def parse_exes(text):
-    out = set()
-    for tok in text.replace(";", ",").replace("\n", ",").split(","):
-        tok = tok.strip().lower()
-        if tok:
-            out.add(tok if "." in tok else tok + ".exe")
-    return out
+def version_tuple(v):
+    out = []
+    for part in str(v or "0").split("."):
+        try:
+            out.append(int(part))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
 
 
 class TabServer:
     """
-    Tiny HTTP server on 127.0.0.1. The extension polls GET /state once a second
-    and POSTs /status ("I locked the tab" / heartbeat / error).
-    It keeps running after a session ends (active=False) so Chrome unlocks
-    within a second instead of waiting for the "app vanished" timeout.
+    Tiny HTTP server on 127.0.0.1, started with the app. The extension polls
+    GET /state once a second and POSTs /status (heartbeat, "I locked the tab",
+    errors). Between sessions active=False, so Chrome unlocks within a second.
     """
 
     def __init__(self):
         self.active = False
+        self.paused = False
         self.exact = True
         self.session = ""
         self.locked_url = ""
         self.status = {}
         self.status_at = 0.0
+        self.ext = {}               # what the extension last told us about itself
+        self.ext_at = 0.0           # last /status from the extension
+        self.poll_at = 0.0          # last /state poll (older extensions only poll)
+        self.ext_version = ""       # extension version written to disk, if any
         self.port = TAB_PORT
         self._httpd = None
-        self._thread = None
+
+    def start(self):
+        if self._httpd is not None:
+            return True
+        try:
+            self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler())
+        except OSError:
+            return False
+        self._httpd.daemon_threads = True
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return True
 
     def begin(self, exact):
-        """Start a new locked session. Returns False if the port is unavailable."""
+        """Start a new locked session."""
         self.session = "%d-%d" % (os.getpid(), int(time.time() * 1000))
         self.exact = bool(exact)
         self.locked_url = ""
         self.status = {}
         self.status_at = 0.0
-        if self._httpd is None:
-            try:
-                self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler())
-            except OSError:
-                return False
-            self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-            self._thread.start()
+        self.paused = False
         self.active = True
-        return True
 
     def end(self):
         self.active = False
+        self.paused = False
+
+    def connected(self):
+        return time.time() - max(self.ext_at, self.poll_at) < 5
 
     def snapshot(self):
-        return {"active": self.active, "exact": self.exact,
-                "session": self.session, "locked_url": self.locked_url}
+        return {"active": self.active, "paused": self.paused, "exact": self.exact,
+                "session": self.session, "locked_url": self.locked_url,
+                "ext_version": self.ext_version}
 
     def set_status(self, data):
-        if not isinstance(data, dict) or data.get("session") != self.session:
+        if not isinstance(data, dict):
+            return
+        self.ext = {"id": str(data.get("id") or ""),
+                    "version": str(data.get("version") or ""),
+                    "incognito": data.get("incognito")}
+        self.ext_at = time.time()
+        if not self.session or data.get("session") != self.session:
             return
         self.status = data
         self.status_at = time.time()
@@ -447,6 +705,7 @@ class TabServer:
                 if not self._origin_ok():
                     return self._send(403, {})
                 if self.path.split("?")[0] == "/state":
+                    srv.poll_at = time.time()
                     return self._send(200, srv.snapshot())
                 self._send(404, {})
 
@@ -469,26 +728,31 @@ class TabServer:
 # ============================================================================
 #  The Chrome extension (written to disk by the "Install" button)
 # ============================================================================
+EXT_VERSION = "1.1"
+
 EXT_MANIFEST = r"""{
   "manifest_version": 3,
   "name": "Focus Lock (companion)",
-  "version": "1.0",
+  "version": "__VERSION__",
   "description": "Locks Chrome to a single tab while the Focus Lock app is running a session.",
   "permissions": ["tabs", "webNavigation", "storage", "alarms"],
   "host_permissions": ["http://127.0.0.1/*"],
   "background": { "service_worker": "background.js" },
+  "incognito": "spanning",
   "action": { "default_title": "Focus Lock" }
 }
-"""
+""".replace("__VERSION__", EXT_VERSION)
 
 EXT_JS = r"""// Focus Lock companion extension (Manifest V3).
 // The Focus Lock app serves /state and /status on 127.0.0.1; this script polls it.
 const API = "http://127.0.0.1:9334";
+const VERSION = chrome.runtime.getManifest().version;
 const POLL_MS = 1000;
+const HELLO_MS = 2000;      // heartbeat so the app can show "connected"
 const GIVE_UP_MS = 10000;   // app stopped answering -> unlock (never trap the user)
 const BOUNCE_LIMIT = 8;     // 8 bounces in 10s on the same site = page rewrites its own URL
 
-let state = null;           // null when not locked
+let state = null;           // null when not locked; state.paused is true during a break
 let lastOk = Date.now();
 let lastReport = 0;
 let reopening = false;
@@ -510,10 +774,14 @@ function save() {
   return chrome.storage.session.set({ state: state }).catch(function () {});
 }
 
+function enforcing() {
+  return !!state && !state.paused;
+}
+
 function badge() {
   try {
-    chrome.action.setBadgeText({ text: state ? "ON" : "" });
-    chrome.action.setBadgeBackgroundColor({ color: "#38bdf8" });
+    chrome.action.setBadgeText({ text: !state ? "" : state.paused ? "BRK" : "ON" });
+    chrome.action.setBadgeBackgroundColor({ color: state && state.paused ? "#fbbf24" : "#38bdf8" });
   } catch (e) {}
 }
 
@@ -543,20 +811,46 @@ function allowed(url) {
 }
 
 // ---- talking to the app ----------------------------------------------------
-async function report(session, locked, error) {
-  let incognito = false;
-  try { incognito = await chrome.extension.isAllowedIncognitoAccess(); } catch (e) {}
+async function incognitoAllowed() {
+  try { return await chrome.extension.isAllowedIncognitoAccess(); } catch (e) { return null; }
+}
+
+async function report(session, locked, error, code) {
   lastReport = Date.now();
+  const body = {
+    session: session || "", locked: !!locked, paused: !!(state && state.paused),
+    error: error || "", code: code || "", url: state ? state.good : "",
+    incognito: await incognitoAllowed(), id: chrome.runtime.id, version: VERSION
+  };
   try {
     await fetch(API + "/status", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session: session, locked: locked, error: error || "",
-        url: state ? state.good : "", incognito: incognito
-      })
+      body: JSON.stringify(body)
     });
   } catch (e) {}
+}
+
+function newer(a, b) {      // is version a newer than version b?
+  const pa = String(a).split(".").map(Number), pb = String(b).split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+async function maybeReload(want) {
+  // The app rewrote our files with a newer version: pick them up (idle only).
+  if (state || !want || !newer(want, VERSION)) return;
+  try {
+    const r = await chrome.storage.local.get("reloadAt");
+    if (r.reloadAt && Date.now() - r.reloadAt < 60000) return;
+    await chrome.storage.local.set({ reloadAt: Date.now() });
+  } catch (e) {
+    return;
+  }
+  chrome.runtime.reload();
 }
 
 async function poll() {
@@ -571,23 +865,43 @@ async function poll() {
     return;
   }
   if (s.active) {
-    if (!state || state.session !== s.session) {
+    if (state && state.session !== s.session) await unlock();   // left over from an old session
+    if (s.paused) {
+      if (state && !state.paused) await pause();
+    } else if (!state) {
       await lock(s);
+    } else if (state.paused) {
+      await resume();
     } else {
       await verify();
-      if (state && Date.now() - lastReport > 2000) await report(state.session, true, "");
     }
   } else if (state) {
     await unlock();
+  } else {
+    await maybeReload(s.ext_version);
   }
+  if (Date.now() - lastReport > HELLO_MS) await report(state ? state.session : "", !!state, "");
 }
 
-// ---- lock / unlock ---------------------------------------------------------
+// ---- lock / unlock / break -------------------------------------------------
 async function lock(s) {
+  if (await incognitoAllowed() === false) {
+    return report(s.session, false,
+      "Focus Lock isn't allowed in Incognito, so a private window would get around the tab lock. " +
+      "Open the extension's settings, switch on 'Allow in Incognito', then press Start again.",
+      "incognito");
+  }
   const recovering = !!s.locked_url;   // Chrome was restarted mid-session
   let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true, windowType: "normal" });
   if (!tabs.length) tabs = await chrome.tabs.query({ active: true, windowType: "normal" });
   const tab = tabs[0];
+  if (!tab && recovering) {
+    state = { session: s.session, tabId: -1, windowId: -1, base: s.locked_url, good: s.locked_url,
+              exact: !!s.exact, known: [], paused: false };
+    await save();
+    badge();
+    return reopen(true);
+  }
   if (!tab) {
     return report(s.session, false, "No Chrome window found. Open the page you want to study in Chrome first.");
   }
@@ -605,24 +919,66 @@ async function lock(s) {
   const all = await chrome.tabs.query({});
   state = {
     session: s.session, tabId: tab.id, windowId: tab.windowId,
-    base: base, good: base, exact: !!s.exact,
+    base: base, good: base, exact: !!s.exact, paused: false,
     known: all.map(function (t) { return t.id; })
   };
   await save();
   badge();
-  try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) {}
+  await focusStudyTab();
   await report(s.session, true, "");
 }
 
 async function unlock() {
   state = null;
+  bounces = [];
   await save();
   badge();
 }
 
+async function pause() {
+  state.paused = true;
+  bounces = [];
+  await save();
+  badge();
+  await report(state.session, true, "");
+}
+
+async function resume() {
+  // Break is over: keep tabs opened during the break, but go back to the study tab.
+  state.paused = false;
+  try {
+    const all = await chrome.tabs.query({});
+    state.known = all.map(function (t) { return t.id; });
+  } catch (e) {}
+  await save();
+  badge();
+  let tab = null;
+  try { tab = await chrome.tabs.get(state.tabId); } catch (e) {}
+  if (!tab) {
+    await reopen(false);
+  } else {
+    if (tab.url && !allowed(tab.url)) {
+      try { await chrome.tabs.update(tab.id, { url: state.good }); } catch (e) {}
+    }
+    await focusStudyTab();
+  }
+  await report(state.session, true, "");
+}
+
+async function focusStudyTab() {
+  if (!state) return;
+  try {
+    const t = await chrome.tabs.update(state.tabId, { active: true });
+    state.windowId = t.windowId;
+    const w = await chrome.windows.get(t.windowId);
+    await chrome.windows.update(t.windowId,
+      w.state === "minimized" ? { state: "normal", focused: true } : { focused: true });
+  } catch (e) {}
+}
+
 // ---- enforcement -----------------------------------------------------------
 async function bounce(url, preCommit) {
-  if (!state) return;
+  if (!enforcing()) return;
   const now = Date.now();
   bounces = bounces.filter(function (b) { return now - b.t < 10000; });
   const kind = !!preCommit;
@@ -645,7 +1001,7 @@ async function bounce(url, preCommit) {
 }
 
 function check(url, committed) {
-  if (!state) return;
+  if (!enforcing()) return;
   if (allowed(url)) {
     if (committed && state.good !== url) { state.good = url; save(); }
   } else {
@@ -653,24 +1009,46 @@ function check(url, committed) {
   }
 }
 
-async function reopen() {
+async function reopen(newWindow) {
+  // Bring the study tab back. If no normal window is left (e.g. on a Mac after
+  // closing Chrome's last window, Chrome keeps running), open a fresh window.
   if (!state || reopening) return;
   reopening = true;
   try {
-    const t = await chrome.tabs.create({ url: state.good, active: true });
-    state.tabId = t.id;
-    state.windowId = t.windowId;
-    await save();
+    let t = null;
+    if (!newWindow) {
+      const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
+      const target = wins.find(function (w) { return w.id === state.windowId; }) || wins[0];
+      if (target) {
+        try {
+          t = await chrome.tabs.create({ windowId: target.id, url: state.good, active: true });
+        } catch (e) {
+          t = null;
+        }
+      }
+    }
+    if (!t) {
+      const w = await chrome.windows.create({ url: state.good, focused: true, type: "normal" });
+      t = w && w.tabs && w.tabs[0];
+    }
+    if (t) {
+      state.tabId = t.id;
+      state.windowId = t.windowId;
+      if (state.known.indexOf(t.id) === -1) state.known.push(t.id);
+      await save();
+      await focusStudyTab();
+      await report(state.session, true, "");
+    }
   } catch (e) {
   } finally {
-    reopening = false;
+    setTimeout(function () { reopening = false; }, 300);
   }
 }
 
 async function verify() {
-  if (!state || reopening) return;
+  if (!enforcing() || reopening) return;
   let tab;
-  try { tab = await chrome.tabs.get(state.tabId); } catch (e) { return reopen(); }
+  try { tab = await chrome.tabs.get(state.tabId); } catch (e) { return reopen(false); }
   const all = await chrome.tabs.query({});
   for (const t of all) {
     if (t.id !== state.tabId && state.known.indexOf(t.id) === -1) {
@@ -686,18 +1064,18 @@ async function verify() {
 
 chrome.tabs.onCreated.addListener(async function (tab) {
   await ready;
-  if (!state || reopening) return;     // the tab we create ourselves is adopted in reopen()
+  if (!enforcing() || reopening) return;     // the tab we create ourselves is adopted in reopen()
   if (tab.id !== state.tabId) chrome.tabs.remove(tab.id).catch(function () {});
 });
 
-chrome.tabs.onRemoved.addListener(async function (tabId) {
+chrome.tabs.onRemoved.addListener(async function (tabId, info) {
   await ready;
-  if (state && tabId === state.tabId) await reopen();
+  if (enforcing() && tabId === state.tabId) await reopen(!!(info && info.isWindowClosing));
 });
 
 chrome.tabs.onActivated.addListener(async function (info) {
   await ready;
-  if (!state || reopening || info.tabId === state.tabId) return;
+  if (!enforcing() || reopening || info.tabId === state.tabId) return;
   try {
     await chrome.tabs.update(state.tabId, { active: true });
     if (info.windowId !== state.windowId) {
@@ -708,7 +1086,7 @@ chrome.tabs.onActivated.addListener(async function (info) {
 
 chrome.windows.onFocusChanged.addListener(async function (windowId) {
   await ready;
-  if (!state || reopening) return;
+  if (!enforcing() || reopening) return;
   if (windowId === chrome.windows.WINDOW_ID_NONE || windowId === state.windowId) return;
   try { await chrome.windows.update(state.windowId, { focused: true }); } catch (e) {}
 });
@@ -725,12 +1103,12 @@ chrome.tabs.onReplaced.addListener(async function (addedId, removedId) {
 
 chrome.webNavigation.onBeforeNavigate.addListener(async function (d) {
   await ready;
-  if (state && d.frameId === 0 && d.tabId === state.tabId) check(d.url, false);
+  if (enforcing() && d.frameId === 0 && d.tabId === state.tabId) check(d.url, false);
 });
 
 chrome.tabs.onUpdated.addListener(async function (tabId, change) {
   await ready;
-  if (state && tabId === state.tabId && change.url) check(change.url, true);
+  if (enforcing() && tabId === state.tabId && change.url) check(change.url, true);
 });
 
 // ---- keep the service worker alive and polling -----------------------------
@@ -754,32 +1132,608 @@ loop();
 
 
 def write_extension():
+    """Write the extension files if they changed. Returns the folder."""
     os.makedirs(EXT_DIR, exist_ok=True)
-    with open(os.path.join(EXT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
-        f.write(EXT_MANIFEST)
-    with open(os.path.join(EXT_DIR, "background.js"), "w", encoding="utf-8") as f:
-        f.write(EXT_JS)
+    for name, text in (("manifest.json", EXT_MANIFEST), ("background.js", EXT_JS)):
+        path = os.path.join(EXT_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read() == text:
+                    continue
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
     return EXT_DIR
 
 
+def refresh_installed_extension():
+    """If the extension was installed before, keep its files current. True if up to date."""
+    if not os.path.isfile(os.path.join(EXT_DIR, "manifest.json")):
+        return False
+    try:
+        write_extension()
+        return True
+    except OSError:
+        return False
+
+
 # ============================================================================
-#  UI helpers
+#  Custom controls (drawn on canvases so everything can be rounded)
 # ============================================================================
-def lbl(parent, text, size=11, color=FG, bold=False, **kw):
-    return tk.Label(parent, text=text, bg=BG, fg=color,
-                    font=(FONT, size, "bold" if bold else "normal"), **kw)
+def mix(a, b, t):
+    """Blend two #rrggbb colours: t=0 -> a, t=1 -> b."""
+    ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(ca, cb))
 
 
-def btn(parent, text, command, color=ACCENT, size=11, fg="#0f172a", **kw):
-    return tk.Button(parent, text=text, command=command, bg=color, fg=fg,
-                     activebackground=color, activeforeground=fg, relief="flat",
-                     bd=0, padx=14, pady=7, font=(FONT, size, "bold"),
-                     cursor="hand2", **kw)
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    r = max(0.0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = (x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y1 + r,
+           x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
+           x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1)
+    return cv.create_polygon(pts, smooth=True, **kw)
 
 
-def entry(parent, var, width=20, **kw):
-    return tk.Entry(parent, textvariable=var, width=width, font=(FONT, 11),
-                    bg=PANEL, fg=FG, insertbackground=FG, relief="flat", **kw)
+def watch_var(widget, var, callback):
+    """var.trace that is removed again when the widget is destroyed."""
+    def fire(*_a):
+        try:
+            if widget.winfo_exists():
+                callback()
+        except tk.TclError:
+            pass
+    tid = var.trace_add("write", fire)
+
+    def gone(e):
+        if e.widget is widget:
+            try:
+                var.trace_remove("write", tid)
+            except (tk.TclError, ValueError):
+                pass
+    widget.bind("<Destroy>", gone, add="+")
+
+
+def bold(size):
+    return tkfont.Font(family=FONT, size=size, weight="bold")
+
+
+class RoundButton(tk.Canvas):
+    """Pill-shaped button. kind: primary | secondary | warn | ghost."""
+
+    def __init__(self, parent, text, command, kind="primary", size=11,
+                 padx=18, pady=9, hover_fg=None, width=None):
+        self.bg = parent["bg"]
+        self.text, self.command, self.kind = text, command, kind
+        self.hover_fg = hover_fg
+        self.font = bold(size)
+        self.padx, self.fixed_w = px(padx), width
+        self.h = self.font.metrics("linespace") + 2 * px(pady)
+        self.w = width or self.font.measure(text) + 2 * self.padx
+        super().__init__(parent, width=self.w, height=self.h, bg=self.bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.enabled, self.hover, self.pressed = True, False, False
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Configure>", self._resized)
+        self._draw()
+
+    def _colors(self):
+        k = self.kind
+        if not self.enabled:
+            return (PANEL if k != "ghost" else None), SUBTLE
+        if k == "primary":
+            fill, fg = (ACCENT_HI if self.hover else ACCENT), INK
+        elif k == "warn":
+            fill, fg = (WARN_HI if self.hover else WARN), INK
+        elif k == "secondary":
+            fill, fg = (PANEL_HI if self.hover else PANEL), FG
+        else:  # ghost
+            fill = PANEL if self.hover else None
+            fg = (self.hover_fg or FG) if self.hover else MUTED
+        if self.pressed and fill:
+            fill = mix(fill, BG, 0.18)
+        return fill, fg
+
+    def _draw(self):
+        self.delete("all")
+        fill, fg = self._colors()
+        if fill:
+            round_rect(self, 0, 0, self.w - 1, self.h - 1, self.h / 2.0, fill=fill, outline=fill)
+        self.create_text(self.w / 2.0, self.h / 2.0, text=self.text, font=self.font, fill=fg)
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self._draw()
+
+    def _resized(self, e):
+        if (e.width, e.height) != (self.w, self.h):
+            self.w, self.h = e.width, e.height
+            self._draw()
+
+    def _release(self, e):
+        was = self.pressed
+        self._set(pressed=False)
+        if was and self.enabled and 0 <= e.x <= self.w and 0 <= e.y <= self.h and self.command:
+            self.command()
+
+    def _stretched(self):
+        try:
+            return self.winfo_manager() == "pack" and self.pack_info().get("fill") in ("x", "both")
+        except tk.TclError:
+            return False
+
+    def set_text(self, text):
+        self.text = text
+        if not self.fixed_w and not self._stretched():
+            self.w = self.font.measure(text) + 2 * self.padx
+            self.configure(width=self.w)
+        self._draw()
+
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        self.configure(cursor="hand2" if on else "arrow")
+        self._draw()
+
+
+class Toggle(tk.Frame):
+    """Switch + label (+ optional muted line underneath)."""
+
+    def __init__(self, parent, text, variable, sub=None, command=None):
+        bg = parent["bg"]
+        super().__init__(parent, bg=bg, cursor="hand2")
+        self.var, self.command = variable, command
+        self.sw = tk.Canvas(self, width=px(38), height=px(22), bg=bg,
+                            highlightthickness=0, cursor="hand2")
+        self.sw.pack(side="left", anchor="n", pady=(px(1), 0))
+        col = tk.Frame(self, bg=bg, cursor="hand2")
+        col.pack(side="left", padx=(px(10), 0), fill="x")
+        parts = [self, self.sw, col,
+                 tk.Label(col, text=text, bg=bg, fg=FG, font=(FONT, 10), cursor="hand2")]
+        parts[-1].pack(anchor="w")
+        if sub:
+            parts.append(tk.Label(col, text=sub, bg=bg, fg=SUBTLE, font=(FONT, 9),
+                                  cursor="hand2", justify="left"))
+            parts[-1].pack(anchor="w")
+        for w in parts:
+            w.bind("<Button-1>", self.toggle)
+        watch_var(self, variable, self._draw)
+        self._draw()
+
+    def toggle(self, _e=None):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        c = self.sw
+        c.delete("all")
+        w, h = px(38), px(22)
+        on = bool(self.var.get())
+        round_rect(c, 0, 0, w - 1, h - 1, h / 2.0,
+                   fill=ACCENT if on else PANEL, outline=ACCENT if on else BORDER)
+        d = h - px(8)
+        x = w - px(4) - d if on else px(4)
+        c.create_oval(x, px(4), x + d, px(4) + d, fill="#f8fafc" if on else MUTED, outline="")
+
+
+class Segmented(tk.Canvas):
+    """Row of options, one of them selected (bound to a StringVar)."""
+
+    def __init__(self, parent, options, variable, command=None, size=10,
+                 padx=14, pady=8, equal=False):
+        self.font = bold(size)
+        self.options, self.var, self.command = options, variable, command
+        self.inset = px(3)
+        widths = [self.font.measure(label) + 2 * px(padx) for _v, label in options]
+        if equal:
+            widths = [max(widths)] * len(widths)
+        self.h = self.font.metrics("linespace") + 2 * px(pady)
+        self.w = sum(widths) + 2 * self.inset
+        super().__init__(parent, width=self.w, height=self.h, bg=parent["bg"],
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.spans, x = [], self.inset
+        for wd in widths:
+            self.spans.append((x, x + wd))
+            x += wd
+        self.hover = None
+        self.bind("<Button-1>", self._click)
+        self.bind("<Motion>", lambda e: self._hover(self._index(e.x)))
+        self.bind("<Leave>", lambda e: self._hover(None))
+        watch_var(self, variable, self._draw)
+        self._draw()
+
+    def _index(self, x):
+        for i, (a, b) in enumerate(self.spans):
+            if a <= x < b:
+                return i
+        return None
+
+    def _hover(self, i):
+        if i != self.hover:
+            self.hover = i
+            self._draw()
+
+    def _click(self, e):
+        i = self._index(e.x)
+        if i is not None:
+            self.var.set(self.options[i][0])
+            if self.command:
+                self.command()
+
+    def _draw(self):
+        self.delete("all")
+        r = self.h / 2.0
+        round_rect(self, 0, 0, self.w - 1, self.h - 1, r, fill=PANEL, outline=PANEL)
+        cur = str(self.var.get()).strip()
+        ins = self.inset
+        for i, ((value, label), (a, b)) in enumerate(zip(self.options, self.spans)):
+            sel = str(value) == cur
+            if sel:
+                round_rect(self, a, ins, b, self.h - 1 - ins, r - ins, fill=ACCENT, outline=ACCENT)
+            elif i == self.hover:
+                round_rect(self, a, ins, b, self.h - 1 - ins, r - ins, fill=PANEL_HI, outline=PANEL_HI)
+            fg = INK if sel else (FG if i == self.hover else MUTED)
+            self.create_text((a + b) / 2.0, self.h / 2.0, text=label, font=self.font, fill=fg)
+
+
+class Stepper(tk.Canvas):
+    """  -  value  +   pill, stepping through a fixed list of values."""
+
+    def __init__(self, parent, values, variable, fmt, command=None, size=10):
+        self.values, self.var, self.fmt, self.command = values, variable, fmt, command
+        self.font = bold(size)
+        self.h = self.font.metrics("linespace") + 2 * px(8)
+        self.bw = self.h
+        vw = max(self.font.measure(fmt(v)) for v in values) + px(14)
+        self.w = 2 * self.bw + vw
+        super().__init__(parent, width=self.w, height=self.h, bg=parent["bg"],
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.enabled, self.hover = True, 0
+        self.bind("<Button-1>", self._click)
+        self.bind("<Motion>", self._motion)
+        self.bind("<Leave>", lambda e: self._sethover(0))
+        watch_var(self, variable, self._draw)
+        self._draw()
+
+    def _pos(self):
+        v = _nearest(self.var.get(), self.values)
+        return self.values.index(v)
+
+    def _zone(self, x):
+        if x < self.bw:
+            return -1
+        if x > self.w - self.bw:
+            return 1
+        return 0
+
+    def _motion(self, e):
+        self._sethover(self._zone(e.x))
+
+    def _sethover(self, z):
+        if z != self.hover:
+            self.hover = z
+            self._draw()
+
+    def _click(self, e):
+        z = self._zone(e.x)
+        if not z or not self.enabled:
+            return
+        i = self._pos() + z
+        if 0 <= i < len(self.values):
+            self.var.set(self.values[i])
+            if self.command:
+                self.command()
+
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        h, w, bw = self.h, self.w, self.bw
+        round_rect(self, 0, 0, w - 1, h - 1, h / 2.0, fill=PANEL, outline=PANEL)
+        i = self._pos()
+        for z, cx, can in ((-1, bw / 2.0, i > 0), (1, w - bw / 2.0, i < len(self.values) - 1)):
+            can = can and self.enabled
+            if can and self.hover == z:
+                d = h - px(8)
+                self.create_oval(cx - d / 2, h / 2 - d / 2, cx + d / 2, h / 2 + d / 2,
+                                 fill=PANEL_HI, outline="")
+            col = FG if can else SUBTLE
+            L = px(4.5)
+            self.create_line(cx - L, h / 2, cx + L, h / 2, fill=col, width=px(2), capstyle="round")
+            if z > 0:
+                self.create_line(cx, h / 2 - L, cx, h / 2 + L, fill=col, width=px(2), capstyle="round")
+        self.create_text(w / 2.0, h / 2.0, text=self.fmt(self.values[i]), font=self.font,
+                         fill=FG if self.enabled else SUBTLE)
+
+
+class RoundEntry(tk.Canvas):
+    """Text entry inside a rounded box that lights up when focused."""
+
+    def __init__(self, parent, variable, width, size=11, justify="left"):
+        font = tkfont.Font(family=FONT, size=size)
+        self.h = font.metrics("linespace") + 2 * px(8)
+        super().__init__(parent, width=width, height=self.h, bg=parent["bg"],
+                         highlightthickness=0, bd=0, cursor="xterm")
+        self.entry = tk.Entry(self, textvariable=variable, font=font, bg=PANEL, fg=FG,
+                              insertbackground=FG, relief="flat", bd=0,
+                              highlightthickness=0, justify=justify,
+                              disabledbackground=PANEL, selectbackground=ACCENT,
+                              selectforeground=INK)
+        self._win = self.create_window(0, 0, window=self.entry, anchor="w")
+        self.focused, self.error = False, False
+        self.entry.bind("<FocusIn>", lambda e: self._set(focused=True), add="+")
+        self.entry.bind("<FocusOut>", lambda e: self._set(focused=False), add="+")
+        self.entry.bind("<Key>", lambda e: self.error and self._set(error=False), add="+")
+        self.bind("<Button-1>", lambda e: self.entry.focus_set())
+        self.bind("<Configure>", lambda e: self._draw())
+        self._draw()
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self._draw()
+
+    def _draw(self):
+        w = self.winfo_width() if self.winfo_ismapped() else int(self.cget("width"))
+        h = self.h
+        self.delete("box")
+        outline = DANGER if self.error else (ACCENT if self.focused else BORDER)
+        round_rect(self, 1, 1, w - 2, h - 2, px(10), fill=PANEL, outline=outline, width=px(1.5),
+                   tags="box")
+        self.tag_lower("box")
+        pad = px(12)
+        self.coords(self._win, pad, h / 2.0)
+        self.itemconfig(self._win, width=max(10, w - 2 * pad))
+
+    def focus_entry(self):
+        self.entry.focus_force()
+
+
+class StatCard(tk.Canvas):
+    def __init__(self, parent, width, height, title, value, sub, dots=None, color=ACCENT):
+        super().__init__(parent, width=width, height=height, bg=parent["bg"],
+                         highlightthickness=0, bd=0)
+        w, h, p = width, height, px(16)
+        round_rect(self, 1, 1, w - 2, h - 2, px(16), fill=SURFACE, outline=BORDER)
+        self.create_text(p, p, anchor="nw", text=title, fill=SUBTLE, font=(FONT, 8, "bold"))
+        self.create_text(p, p + px(17), anchor="nw", text=value, fill=FG, font=(FONT, 19, "bold"))
+        self.create_text(p, h - p + px(2), anchor="sw", text=sub, fill=MUTED, font=(FONT, 9))
+        if dots:
+            d, gap = px(8), px(4)
+            x = w - p - len(dots) * d - (len(dots) - 1) * gap
+            y = p + px(2)
+            for i, on in enumerate(dots):
+                last = i == len(dots) - 1
+                self.create_oval(x, y, x + d, y + d, fill=color if on else "#334155",
+                                 outline=FG if last and not on else (color if on else "#334155"))
+                x += d + gap
+
+
+class CheckList(tk.Frame):
+    """Scrollable list of apps with rounded check boxes."""
+
+    def __init__(self, parent, width, height):
+        bg = parent["bg"]
+        super().__init__(parent, bg=bg)
+        self.box = tk.Canvas(self, width=width, height=height, bg=bg, highlightthickness=0, bd=0)
+        self.box.pack(fill="x")
+        self.view = tk.Canvas(self.box, bg=SURFACE, highlightthickness=0, bd=0,
+                              yscrollincrement=px(16))
+        self.rows = tk.Frame(self.view, bg=SURFACE)
+        self._rows_win = self.view.create_window(0, 0, window=self.rows, anchor="nw")
+        self._view_win = self.box.create_window(px(5), px(6), window=self.view, anchor="nw")
+        self.box.bind("<Configure>", lambda e: self._layout())
+        self.rows.bind("<Configure>", lambda e: self._scrolled())
+        self.vars = {}
+        self.bind_all("<MouseWheel>", self._wheel, add="+")
+        self.bind_all("<Button-4>", self._wheel, add="+")
+        self.bind_all("<Button-5>", self._wheel, add="+")
+
+    def _layout(self):
+        w, h = self.box.winfo_width(), self.box.winfo_height()
+        self.box.delete("frame")
+        round_rect(self.box, 1, 1, w - 2, h - 2, px(14), fill=SURFACE, outline=BORDER, tags="frame")
+        self.box.tag_lower("frame")
+        self.vw, self.vh = max(10, w - px(5) - px(14)), max(10, h - px(12))
+        self.box.itemconfig(self._view_win, width=self.vw, height=self.vh)
+        self.view.itemconfig(self._rows_win, width=self.vw)
+        self._scrolled()
+
+    def _scrolled(self):
+        if not self.winfo_exists():
+            return
+        rh = self.rows.winfo_reqheight()
+        self.view.configure(scrollregion=(0, 0, getattr(self, "vw", 1), rh))
+        self.box.delete("thumb")
+        top, bottom = self.view.yview()
+        if bottom - top < 0.999:
+            h = self.box.winfo_height()
+            x = self.box.winfo_width() - px(8)
+            y1 = px(10) + (h - px(20)) * top
+            y2 = px(10) + (h - px(20)) * bottom
+            self.box.create_line(x, y1, x, y2, fill=PANEL_HI, width=px(4),
+                                 capstyle="round", tags="thumb")
+
+    def _wheel(self, e):
+        try:
+            if not self.winfo_exists():
+                return
+            w = self.winfo_containing(e.x_root, e.y_root)
+        except (tk.TclError, KeyError):
+            return
+        if w is None or not str(w).startswith(str(self)):
+            return
+        if getattr(e, "num", None) == 4:
+            step = -1
+        elif getattr(e, "num", None) == 5:
+            step = 1
+        else:
+            step = -1 if e.delta > 0 else 1
+        self.view.yview_scroll(step * 2, "units")
+        self._scrolled()
+
+    def set_items(self, items):
+        """items: [(exe, title, checked)]"""
+        for w in self.rows.winfo_children():
+            w.destroy()
+        self.vars = {}
+        if not items:
+            tk.Label(self.rows, text="No other apps are open right now.", bg=SURFACE,
+                     fg=SUBTLE, font=(FONT, 9)).pack(anchor="w", padx=px(10), pady=px(10))
+        for exe, title, checked in items:
+            var = tk.BooleanVar(value=checked)
+            self.vars[exe] = var
+            self._row(exe, title, var)
+        self.view.yview_moveto(0)
+        self.after_idle(self._scrolled)
+
+    def checked(self):
+        return sorted(exe for exe, v in self.vars.items() if v.get())
+
+    def _row(self, exe, title, var):
+        row = tk.Frame(self.rows, bg=SURFACE, cursor="hand2")
+        row.pack(fill="x")
+        s = px(18)
+        chk = tk.Canvas(row, width=s, height=s, bg=SURFACE, highlightthickness=0, cursor="hand2")
+        chk.pack(side="left", padx=(px(10), px(10)), pady=px(6))
+        name = tk.Label(row, text=exe, bg=SURFACE, fg=FG, font=(FONT, 10), cursor="hand2")
+        name.pack(side="left")
+        sub = tk.Label(row, text=title[:38], bg=SURFACE, fg=SUBTLE, font=(FONT, 9),
+                       anchor="w", cursor="hand2")
+        sub.pack(side="left", padx=(px(8), px(4)), fill="x", expand=True)
+        parts = (row, chk, name, sub)
+
+        def draw():
+            chk.delete("all")
+            on = var.get()
+            round_rect(chk, 1, 1, s - 2, s - 2, px(5), fill=ACCENT if on else PANEL,
+                       outline=ACCENT if on else MUTED)
+            if on:
+                chk.create_line(s * 0.27, s * 0.52, s * 0.44, s * 0.69, s * 0.74, s * 0.33,
+                                fill=INK, width=max(2, px(2)), capstyle="round", joinstyle="round")
+
+        def toggle(_e=None):
+            var.set(not var.get())
+            draw()
+
+        def hover(on):
+            for w in parts:
+                w.configure(bg=PANEL if on else SURFACE)
+
+        for w in parts:
+            w.bind("<Button-1>", toggle)
+            w.bind("<Enter>", lambda e: hover(True))
+            w.bind("<Leave>", lambda e: hover(False))
+        draw()
+
+
+class Ring(tk.Canvas):
+    """Clock-style progress ring: tick marks, a sweeping arc, text in the middle."""
+
+    def __init__(self, parent, size, thickness, color=ACCENT, ticks=60,
+                 time_px=None, sub_px=None):
+        super().__init__(parent, width=size, height=size, bg=parent["bg"],
+                         highlightthickness=0, bd=0)
+        self.size, self.th, self.color, self.nticks = size, thickness, color, ticks
+        c = self.c = size / 2.0
+        outer = c - 2
+        major = max(4.0, size * 0.04)
+        minor = major * 0.5
+        if ticks:
+            self.rr = outer - major - max(5.0, size * 0.035) - thickness / 2.0
+        else:
+            self.rr = outer - thickness / 2.0
+        rr = self.rr
+        self.ticks = []
+        for i in range(ticks):
+            a = math.radians(90 - 360.0 * i / ticks)
+            is_major = ticks <= 12 or i % 5 == 0
+            r2 = outer - (major if is_major else minor)
+            tid = self.create_line(c + outer * math.cos(a), c - outer * math.sin(a),
+                                   c + r2 * math.cos(a), c - r2 * math.sin(a),
+                                   width=max(1, px(2) if is_major else px(1)),
+                                   capstyle="round", fill=BORDER)
+            self.ticks.append((tid, is_major))
+        self.create_oval(c - rr, c - rr, c + rr, c + rr, outline=PANEL, width=thickness)
+        self.arc = self.create_arc(c - rr, c - rr, c + rr, c + rr, start=90, extent=-1,
+                                   style="arc", outline=color, width=thickness)
+        d = thickness / 2.0
+        self.cap_a = self.create_oval(c - d, c - rr - d, c + d, c - rr + d, fill=color, outline="")
+        self.cap_b = self.create_oval(0, 0, 0, 0, fill=color, outline="")
+        self.tip = self.create_oval(0, 0, 0, 0, fill="#f8fafc", outline="")
+        self.time_px = time_px or int(size * 0.17)
+        self.sub_px = sub_px or max(px(9), int(size * 0.04))
+        self.top_id = self.create_text(c, c - self.time_px * 0.92, text="", fill=SUBTLE,
+                                       font=(FONT, -int(self.sub_px * 0.8), "bold"))
+        self.time_id = self.create_text(c, c, text="", fill=FG,
+                                        font=(FONT, -self.time_px, "bold"))
+        self.sub_id = self.create_text(c, c + self.time_px * 0.88, text="", fill=MUTED,
+                                       font=(FONT, -self.sub_px))
+        self._lit = -1
+        self._long = None
+
+    def set_color(self, color):
+        self.color = color
+        for item in (self.cap_a, self.cap_b):
+            self.itemconfig(item, fill=color)
+        self.itemconfig(self.arc, outline=color)
+        self._lit = -1
+
+    def set(self, frac, text=None, sub=None, top=None, sub_color=None):
+        frac = max(0.0, min(1.0, frac))
+        c, rr = self.c, self.rr
+        moving = (self.arc, self.cap_a, self.cap_b, self.tip)
+        if frac < 0.001:
+            for item in moving:
+                self.itemconfig(item, state="hidden")
+        else:
+            self.itemconfig(self.arc, extent=-min(359.99, 360.0 * frac))
+            a = math.radians(90 - 360.0 * frac)
+            x, y = c + rr * math.cos(a), c - rr * math.sin(a)
+            d, t = self.th / 2.0, self.th * 0.22
+            self.coords(self.cap_b, x - d, y - d, x + d, y + d)
+            self.coords(self.tip, x - t, y - t, x + t, y + t)
+            for item in moving:
+                self.itemconfig(item, state="normal")
+        if self.nticks:
+            lit = int(math.ceil(frac * self.nticks - 1e-9))
+            if lit != self._lit:
+                self._lit = lit
+                for i, (tid, major) in enumerate(self.ticks):
+                    if i < lit:
+                        col = self.color if major else mix(self.color, self["bg"], 0.45)
+                    else:
+                        col = "#334155" if major else BORDER
+                    self.itemconfig(tid, fill=col)
+        if text is not None:
+            long_text = len(text) > 5
+            if long_text != self._long:
+                self._long = long_text
+                size = int(self.time_px * (0.74 if long_text else 1.0))
+                self.itemconfig(self.time_id, font=(FONT, -size, "bold"))
+            self.itemconfig(self.time_id, text=text)
+        if sub is not None:
+            self.itemconfig(self.sub_id, text=sub, fill=sub_color or MUTED)
+        if top is not None:
+            self.itemconfig(self.top_id, text=top)
+
+
+def section(parent, text, pady=(16, 7)):
+    lab = tk.Label(parent, text=text.upper(), bg=parent["bg"], fg=SUBTLE, font=(FONT, 8, "bold"))
+    lab.pack(anchor="w", pady=(px(pady[0]), px(pady[1])))
+    return lab
+
+
+def label(parent, text, size=10, color=FG, weight="normal", **kw):
+    return tk.Label(parent, text=text, bg=parent["bg"], fg=color,
+                    font=(FONT, size, weight), **kw)
 
 
 # ============================================================================
@@ -788,22 +1742,42 @@ def entry(parent, var, width=20, **kw):
 class FocusLock(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Focus Lock")
+        global _SCALE
+        try:
+            _SCALE = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        except tk.TclError:
+            _SCALE = 1.0
+        self.title(APP_TITLE)
         self.configure(bg=BG)
         self.settings = load_settings()
+        self.stats = Stats()
 
-        self.locked = False
+        self.phase = "setup"            # setup | starting | focus | break | done
+        self.gen = 0                    # bumps on every phase change; stops stale loops
         self.full_lock = True
         self.tab_locked = False
         self.total_seconds = 0
+        self.remaining = 0.0            # focus seconds left (frozen during a break)
         self.end_time = 0.0
-        self.quit_entry = None
+        self.breaks_total = 0
+        self.breaks_left = 0
+        self.break_secs = 0
+        self.break_end = 0.0
+        self.seg_start = None           # monotonic start of focus time not yet saved
+        self.session_focus = 0.0
         self.covers = []
+        self.cover_labels = []
+        self.quit_entry = None
+        self.ring = None
         self.allowed = set()
-        self.app_choices = []
         self.blocker = KeyBlocker()
         self.tabsrv = TabServer()
+        self.port_ok = self.tabsrv.start()
+        if refresh_installed_extension():
+            self.tabsrv.ext_version = EXT_VERSION
         self._last_relaunch = 0.0
+        self._status_token = None
+        self._break_armed_until = 0.0
 
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(expand=True, fill="both")
@@ -811,18 +1785,34 @@ class FocusLock(tk.Tk):
         self.show_setup()
 
     # ---- housekeeping ------------------------------------------------------
+    def new_phase(self, phase):
+        self.phase = phase
+        self.gen += 1
+        return self.gen
+
     def clear(self):
+        self.unbind("<Return>")
+        self.ring = None
         for w in self.container.winfo_children():
             w.destroy()
 
+    def wm_attr(self, win, name, value):
+        try:
+            win.attributes(name, value)
+        except tk.TclError:
+            pass                        # e.g. -toolwindow off Windows
+
     def on_close(self):
-        if self.locked:
-            return  # ignore the X button / Alt+F4 while locked
+        if self.phase in ("focus", "break"):
+            return  # ignore the X button / Alt+F4 during a session
+        if self.phase == "starting":
+            self.cancel_start()
         self.shutdown()
         self.destroy()
 
     def shutdown(self):
         try:
+            self.credit_focus(stop=True)
             self.blocker.stop()
             self.tabsrv.end()
         except Exception:
@@ -839,128 +1829,308 @@ class FocusLock(tk.Tk):
 
     def center_on_primary(self):
         self.update_idletasks()
-        px, py, pw, ph = self.primary_monitor()
-        x = px + (pw - self.winfo_reqwidth()) // 2
-        y = py + max(0, (ph - self.winfo_reqheight()) // 3)
+        px_, py_, pw, ph = self.primary_monitor()
+        x = px_ + (pw - self.winfo_reqwidth()) // 2
+        y = py_ + max(0, (ph - self.winfo_reqheight()) // 3)
         self.geometry("+%d+%d" % (x, y))
+
+    def place_top_center(self):
+        self.update_idletasks()
+        px_, py_, pw, _ph = self.primary_monitor()
+        self.geometry("+%d+%d" % (px_ + (pw - self.winfo_reqwidth()) // 2, py_ + px(6)))
+
+    def release_window(self):
+        """Undo everything a lock screen did to the window."""
+        self.quit_entry = None
+        for cv in self.covers:
+            try:
+                cv.destroy()
+            except tk.TclError:
+                pass
+        self.covers = []
+        self.cover_labels = []
+        self.unbind("<Alt-F4>")
+        self.unbind("<Escape>")
+        self.wm_attr(self, "-fullscreen", False)
+        self.wm_attr(self, "-topmost", False)
+        self.wm_attr(self, "-toolwindow", False)
+        self.container.configure(padx=0, pady=0)
+        self.resizable(False, False)
+        self.geometry("")
+
+    def credit_focus(self, stop=False):
+        """Add focus time since the last save to today's total."""
+        if self.seg_start is None:
+            return
+        now = time.monotonic()
+        secs = now - self.seg_start
+        self.seg_start = None if stop else now
+        if secs > 0:
+            self.session_focus += secs
+            self.stats.add(secs)
+
+    def chime(self, kind):
+        if IS_WINDOWS:
+            play_chime(kind)
+        else:
+            self.bell()
 
     # ---- setup screen ------------------------------------------------------
     def show_setup(self):
+        self.new_phase("setup")
+        self.release_window()
         self.clear()
-        self.container.configure(padx=0, pady=0)
-        self.resizable(False, False)
-        self.attributes("-toolwindow", False)
-        self.attributes("-topmost", False)
-        self.geometry("")
         s = self.settings
-        c = self.container
+        W, gap = px(620), px(18)
+        colw = (W - gap) // 2
 
-        tk.Frame(c, width=560, height=1, bg=BG).pack()  # minimum width spacer
-        lbl(c, "Focus Lock", 24, bold=True).pack(pady=(14, 0))
-        lbl(c, "Pick a time. Once it starts, the only way out is the timer.",
-            10, MUTED).pack(pady=(0, 10))
+        outer = tk.Frame(self.container, bg=BG, padx=px(30), pady=px(24))
+        outer.pack()
+        tk.Frame(outer, width=W, height=1, bg=BG).pack()
 
-        # Duration
-        lbl(c, "How long? (minutes)", 10, MUTED).pack(anchor="w", padx=30)
-        row = tk.Frame(c, bg=BG)
-        row.pack(anchor="w", padx=30, pady=(2, 8))
+        # Header
+        head = tk.Frame(outer, bg=BG)
+        head.pack(fill="x")
+        logo = Ring(head, px(42), px(5), ticks=0)
+        logo.set(0.7)
+        logo.pack(side="left")
+        tf = tk.Frame(head, bg=BG)
+        tf.pack(side="left", padx=(px(12), 0))
+        label(tf, APP_TITLE, 18, weight="bold").pack(anchor="w")
+        label(tf, "Pick a time. Once it starts, the only way out is the timer.",
+              9, MUTED).pack(anchor="w")
+
+        # Today / week / streak
+        today, streak = self.stats.today(), self.stats.streak()
+        cards = tk.Frame(outer, bg=BG)
+        cards.pack(fill="x", pady=(px(18), 0))
+        cw, ch = (W - 2 * px(12)) // 3, px(100)
+        if today >= STREAK_MIN_SECONDS:
+            today_sub = "Streak kept for today"
+        else:
+            today_sub = "%s more for the streak" % fmt_duration(STREAK_MIN_SECONDS - today + 59)
+        StatCard(cards, cw, ch, "TODAY'S FOCUS", fmt_duration(today), today_sub).pack(side="left")
+        StatCard(cards, cw, ch, "THIS WEEK", fmt_duration(self.stats.week()),
+                 "Last 7 days").pack(side="left", padx=px(12))
+        best = self.stats.best_streak()
+        StatCard(cards, cw, ch, "STREAK", plural(streak, "day"),
+                 "Best: %s" % plural(best, "day") if best else "Focus 5 min a day",
+                 dots=self.stats.last7(), color=GOOD).pack(side="left")
+
+        # Duration + breaks side by side
+        grid = tk.Frame(outer, bg=BG)
+        grid.pack(fill="x")
+        grid.columnconfigure(0, minsize=colw)
+        grid.columnconfigure(1, minsize=colw)
+        left = tk.Frame(grid, bg=BG)
+        left.grid(row=0, column=0, sticky="nw", padx=(0, gap))
+        right = tk.Frame(grid, bg=BG)
+        right.grid(row=0, column=1, sticky="nw")
+
+        section(left, "Duration")
+        r = tk.Frame(left, bg=BG)
+        r.pack(anchor="w")
         self.minutes_var = tk.StringVar(value=str(s["minutes"]))
-        for m in PRESETS:
-            btn(row, str(m), lambda mm=m: self.minutes_var.set(str(mm)),
-                color=PANEL, fg=FG, size=10).pack(side="left", padx=(0, 6))
-        entry(row, self.minutes_var, width=6, justify="center").pack(
-            side="left", ipady=6, padx=(8, 0))
+        Segmented(r, [(str(m), str(m)) for m in PRESETS], self.minutes_var,
+                  padx=11).pack(side="left")
+        RoundEntry(r, self.minutes_var, px(62), justify="center").pack(side="left", padx=(px(8), 0))
+        label(r, "min", 10, MUTED).pack(side="left", padx=(px(6), 0))
+
+        section(right, "Breaks")
+        r = tk.Frame(right, bg=BG)
+        r.pack(anchor="w")
+        self.breaks_var = tk.IntVar(value=s["breaks"])
+        self.break_min_var = tk.IntVar(value=s["break_minutes"])
+        Stepper(r, BREAK_COUNTS, self.breaks_var,
+                lambda n: "No breaks" if n == 0 else plural(n, "break"),
+                command=self._breaks_changed).pack(side="left")
+        self.break_of = label(r, "of", 10, MUTED)
+        self.break_of.pack(side="left", padx=px(8))
+        self.break_len = Stepper(r, BREAK_MINUTES, self.break_min_var, lambda m: "%d min" % m)
+        self.break_len.pack(side="left")
+        label(right, "A break freezes the timer and unlocks everything. "
+                     "It re-locks by itself when the break ends.",
+              9, SUBTLE, wraplength=colw, justify="left").pack(anchor="w", pady=(px(6), 0))
+        self._breaks_changed()
 
         # Mode
-        lbl(c, "Mode", 10, MUTED).pack(anchor="w", padx=30)
-        self.mode_var = tk.StringVar(value=s["mode"])
-        for value, text in (
-                ("full", "Full lock - black screen + timer on every monitor"),
-                ("study", "Study mode - only the apps / Chrome tab I allow")):
-            tk.Radiobutton(c, text=text, variable=self.mode_var, value=value,
-                           command=self.on_mode_change, bg=BG, fg=FG,
-                           selectcolor=PANEL, activebackground=BG,
-                           activeforeground=FG, font=(FONT, 10),
-                           anchor="w").pack(anchor="w", padx=26)
+        section(outer, "Mode")
+        mr = tk.Frame(outer, bg=BG)
+        mr.pack(fill="x")
+        self.mode_var = tk.StringVar(value=s["mode"] if s["mode"] in ("full", "study") else "full")
+        seg = Segmented(mr, [("full", "Full lock"), ("study", "Study mode")], self.mode_var,
+                        command=self.on_mode_change, equal=True, padx=18)
+        seg.pack(side="left")
+        self.mode_desc = label(mr, "", 9, MUTED, justify="left",
+                               wraplength=W - seg.w - px(18))
+        self.mode_desc.pack(side="left", padx=(px(16), 0))
 
         # Study-mode options (shown only in study mode)
-        sf = tk.Frame(c, bg=BG)
-        self.study_frame = sf
-        lbl(sf, "Chrome", 10, MUTED).pack(anchor="w")
+        self.study_slot = tk.Frame(outer, bg=BG)
+        self.study_slot.pack(fill="x")
+        sf = self.study_frame = tk.Frame(self.study_slot, bg=BG)
+        sg = tk.Frame(sf, bg=BG)
+        sg.pack(fill="x")
+        sg.columnconfigure(0, minsize=colw)
+        sg.columnconfigure(1, minsize=colw)
+        cl = tk.Frame(sg, bg=BG)
+        cl.grid(row=0, column=0, sticky="nw", padx=(0, gap))
+        cr = tk.Frame(sg, bg=BG)
+        cr.grid(row=0, column=1, sticky="nw")
+
+        section(cl, "Chrome")
+        st = tk.Frame(cl, bg=BG)
+        st.pack(anchor="w", fill="x")
+        self.ext_dot = tk.Canvas(st, width=px(10), height=px(10), bg=BG, highlightthickness=0)
+        self.ext_dot.pack(side="left")
+        self.ext_lbl = label(st, "Checking for the extension...", 9, MUTED,
+                             wraplength=colw - px(20), justify="left")
+        self.ext_lbl.pack(side="left", padx=(px(8), 0))
+        self.ext_btns = tk.Frame(cl, bg=BG)
+        self.ext_btns.pack(anchor="w", pady=(px(8), px(4)))
+        self.ext_fix = RoundButton(self.ext_btns, "Open extension settings",
+                                   self.open_extension_page, kind="warn", size=9, padx=12, pady=5)
+        self.ext_install = RoundButton(self.ext_btns, "Install extension", self.install_extension,
+                                       kind="secondary", size=9, padx=12, pady=5)
+        self.ext_install.pack(side="left")
+
         self.locktab_var = tk.BooleanVar(value=bool(s["locktab"]))
         self.exact_var = tk.BooleanVar(value=bool(s["exact"]))
+        Toggle(cl, "Lock my current Chrome tab", self.locktab_var,
+               sub="Open your page in Chrome first").pack(anchor="w", pady=(px(8), 0))
+        Toggle(cl, "Lock its exact address", self.exact_var,
+               sub="Off: links within the same site are OK").pack(anchor="w", pady=(px(10), 0))
 
-        def check(text, var):
-            return tk.Checkbutton(sf, text=text, variable=var, bg=BG, fg=FG,
-                                  selectcolor=PANEL, activebackground=BG,
-                                  activeforeground=FG, font=(FONT, 10), anchor="w")
-
-        check("Lock my current Chrome tab (open your page in Chrome first)",
-              self.locktab_var).pack(anchor="w")
-        check("Also lock its address (untick to allow links within the same site)",
-              self.exact_var).pack(anchor="w")
-        btn(sf, "Install Chrome extension...", self.install_extension, color=PANEL,
-            fg=FG, size=9).pack(anchor="w", pady=(4, 0))
-
-        lbl(sf, "Allowed apps (click to toggle)", 10, MUTED).pack(anchor="w", pady=(10, 0))
-        lf = tk.Frame(sf, bg=BG)
-        lf.pack(fill="x", pady=(2, 4))
-        self.app_list = tk.Listbox(
-            lf, height=5, selectmode="multiple", exportselection=False,
-            bg=PANEL, fg=FG, selectbackground=ACCENT, selectforeground="#0f172a",
-            relief="flat", highlightthickness=0, font=(FONT, 10))
-        sb = tk.Scrollbar(lf, command=self.app_list.yview)
-        self.app_list.config(yscrollcommand=sb.set)
-        self.app_list.pack(side="left", fill="x", expand=True)
-        sb.pack(side="right", fill="y")
-        r3 = tk.Frame(sf, bg=BG)
-        r3.pack(fill="x")
-        lbl(r3, "Other apps (exe names, comma separated):", 9, MUTED).pack(side="left")
-        btn(r3, "Refresh list", self.refresh_apps, color=PANEL, fg=FG,
-            size=9).pack(side="right")
+        hr = tk.Frame(cr, bg=BG)
+        hr.pack(fill="x")
+        section(hr, "Allowed apps").pack(side="left")
+        RoundButton(hr, "Refresh", self.refresh_apps, kind="ghost", size=8,
+                    padx=10, pady=3).pack(side="right", pady=(px(10), 0))
+        self.app_list = CheckList(cr, colw, px(150))
+        self.app_list.pack(fill="x")
+        label(cr, "Other apps (exe names, comma separated)", 9, SUBTLE).pack(
+            anchor="w", pady=(px(8), px(4)))
         self.extra_var = tk.StringVar(value=s["extra"])
-        entry(sf, self.extra_var, width=50).pack(fill="x", ipady=5, pady=(2, 0))
+        RoundEntry(cr, self.extra_var, colw, size=10).pack(fill="x")
 
-        self.start_btn = btn(c, "Start", self.start, size=13)
-        self.start_btn.pack(pady=(14, 4), ipadx=30)
-        self.error_lbl = lbl(c, "", 10, DANGER, wraplength=500)
-        self.error_lbl.pack(pady=(0, 12))
+        # Start
+        bottom = tk.Frame(outer, bg=BG)
+        bottom.pack(fill="x", pady=(px(22), 0))
+        self.start_btn = RoundButton(bottom, "Start focus", self.start, size=12, pady=11)
+        self.start_btn.pack(fill="x")
+        msg = tk.Frame(outer, bg=BG)
+        msg.pack(fill="x", pady=(px(10), 0))
+        self.msg_lbl = label(msg, "", 10, DANGER, wraplength=W - px(150), justify="left")
+        self.msg_lbl.pack(side="left", anchor="n")
+        self.side_btns = tk.Frame(msg, bg=BG)
+        self.side_btns.pack(side="right", anchor="n")
+        self.cancel_btn = RoundButton(self.side_btns, "Cancel", self.cancel_start,
+                                      kind="ghost", size=9, padx=12, pady=5)
 
+        self.bind("<Return>", lambda e: self.start() if self.phase == "setup" else None)
         self.on_mode_change(resize=False)
         self.refresh_apps()
+        self._status_token = object()
+        self.update_ext_status(self._status_token)
         self.center_on_primary()
 
+    def _breaks_changed(self):
+        on = self.breaks_var.get() > 0
+        self.break_len.set_enabled(on)
+        self.break_of.configure(fg=MUTED if on else SUBTLE)
+
     def on_mode_change(self, resize=True):
-        if self.mode_var.get() == "study":
-            self.study_frame.pack(fill="x", padx=30, pady=(8, 0), before=self.start_btn)
+        study = self.mode_var.get() == "study"
+        if study:
+            self.study_frame.pack(fill="x")
+            self.mode_desc.configure(text="Only the apps you allow stay usable, and Chrome can "
+                                          "be locked to one tab. Alt+Tab still works.")
         else:
             self.study_frame.pack_forget()
+            self.mode_desc.configure(text="Black screen with the timer on every monitor. "
+                                          "Nothing else is usable until it ends.")
         if resize:
             self.geometry("")
+            self.update_idletasks()
+            _x, py_, _w, ph = self.primary_monitor()
+            if self.winfo_rooty() + self.winfo_reqheight() > py_ + ph - px(40):
+                self.center_on_primary()
 
-    def set_error(self, text, color=DANGER):
-        self.error_lbl.config(text=text, fg=color)
+    def set_message(self, text, color=DANGER):
+        self.msg_lbl.configure(text=text, fg=color)
 
     def selected_exes(self):
-        return [self.app_choices[i][0] for i in self.app_list.curselection()]
+        return self.app_list.checked()
 
     def refresh_apps(self):
-        keep = set(self.selected_exes())
+        ticked = set(self.app_list.checked()) if self.app_list.vars else set(self.settings["apps"])
         seen = {}
         for _h, _pid, exe, title in list_app_windows(
                 exclude_pids={os.getpid()}, include_minimized=True):
             if exe and exe not in ALWAYS_ALLOWED:
                 seen.setdefault(exe, title)
-        self.app_choices = sorted(seen.items())
-        self.app_list.delete(0, "end")
-        for i, (exe, title) in enumerate(self.app_choices):
-            self.app_list.insert("end", "%s   -   %s" % (exe, title[:44]))
-            if exe in keep:
-                self.app_list.selection_set(i)
+        for exe in ticked:                      # keep ticked apps visible so they can be un-ticked
+            seen.setdefault(exe, "not running")
+        items = [(exe, title, exe in ticked) for exe, title in sorted(seen.items())]
+        self.app_list.set_items(items)
+
+    # ---- extension status --------------------------------------------------
+    def ext_state(self):
+        """(colour, text, fixable) describing the Chrome extension connection."""
+        if not self.port_ok and not self.tabsrv.start():
+            return DANGER, "Port %d is in use by another program." % TAB_PORT, False
+        self.port_ok = True
+        if not self.tabsrv.connected():
+            return SUBTLE, "Extension not connected. Open Chrome, or install it below.", False
+        info = self.tabsrv.ext
+        if version_tuple(info.get("version") or "1.0") < version_tuple(EXT_VERSION):
+            return WARN, ("Extension is out of date. Click Install extension, then "
+                          "the reload arrow on Focus Lock in chrome://extensions."), False
+        if info.get("incognito") is False:
+            return WARN, "Connected, but not allowed in Incognito.", True
+        return GOOD, "Extension connected", False
+
+    def update_ext_status(self, token):
+        if token is not self._status_token or self.phase not in ("setup", "starting"):
+            return
+        try:
+            color, text, fixable = self.ext_state()
+            d = px(10)
+            self.ext_dot.delete("all")
+            self.ext_dot.create_oval(1, 1, d - 1, d - 1, fill=color, outline="")
+            self.ext_lbl.configure(text=text, fg=FG if color == GOOD else MUTED)
+            if color == GOOD and "Incognito" in self.msg_lbl.cget("text"):
+                self.set_message("")                # the user fixed it - drop the stale error
+            if fixable and not self.ext_fix.winfo_manager():
+                self.ext_fix.pack(side="left", padx=(0, px(8)), before=self.ext_install)
+            elif not fixable and self.ext_fix.winfo_manager():
+                self.ext_fix.pack_forget()
+        except tk.TclError:
+            return
+        self.after(1000, self.update_ext_status, token)
+
+    def open_extension_page(self):
+        ext_id = self.tabsrv.ext.get("id") or ""
+        url = "chrome://extensions/?id=" + ext_id if ext_id else "chrome://extensions"
+        chrome = find_chrome()
+        if chrome:
+            try:
+                subprocess.Popen([chrome, url])
+                return
+            except OSError:
+                pass
+        from tkinter import messagebox
+        messagebox.showinfo(APP_TITLE, "Open %s in Chrome, click Details on Focus Lock and "
+                                       "switch on 'Allow in Incognito'." % url)
 
     def install_extension(self):
         from tkinter import messagebox
-        folder = write_extension()
+        try:
+            folder = write_extension()
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, "Couldn't write the extension files:\n%s" % e)
+            return
+        self.tabsrv.ext_version = EXT_VERSION
         try:
             os.startfile(folder)                       # opens the folder in Explorer
         except Exception:
@@ -978,76 +2148,125 @@ class FocusLock(tk.Tk):
             "(top-right).\n"
             "2. Click 'Load unpacked' and choose the folder that just opened in "
             "Explorer:\n    " + folder + "\n"
-            "3. Click 'Details' on Focus Lock and switch ON 'Allow in Incognito' "
-            "so private windows can't be a loophole.\n"
+            "   (Already installed? Just click the reload arrow on Focus Lock.)\n"
+            "3. Click 'Details' on Focus Lock and switch ON 'Allow in Incognito'. "
+            "This is required - otherwise a private window would get around the lock.\n"
             "4. (Optional) Pin it from the puzzle-piece menu - it shows 'ON' "
-            "while a session is running.\n\n"
+            "while a session is running and 'BRK' during a break.\n\n"
             "If Chrome ever asks about 'local network access' for Focus Lock, "
             "click Allow.")
 
     # ---- starting a session ------------------------------------------------
-    def wait_for_tab_lock(self, timeout=8.0):
-        """Wait for the extension to confirm. Returns '' on success, else a message."""
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            st = self.tabsrv.status
-            if st.get("locked"):
-                return ""
-            if st.get("error"):
-                return st["error"]
-            self.update()
-            time.sleep(0.1)
-        return ("Chrome didn't respond. Make sure Chrome is open and the Focus Lock "
-                "extension is installed (use 'Install Chrome extension...'). "
-                "Clicking the Focus Lock icon in Chrome and pressing Start again can also help.")
-
     def start(self):
+        if self.phase != "setup":
+            return
         try:
             minutes = float(self.minutes_var.get())
             if not 0.1 <= minutes <= 600:
                 raise ValueError
         except ValueError:
-            self.set_error("Enter a number of minutes between 1 and 600.")
+            self.set_message("Enter a number of minutes between 1 and 600.")
             return
 
         mode = self.mode_var.get()
+        apps = self.selected_exes()
+        extra = self.extra_var.get().strip()
         allowed, lock_tab = set(), False
         if mode == "study":
-            allowed = set(self.selected_exes()) | parse_exes(self.extra_var.get())
+            allowed = set(apps) | parse_exes(extra)
             lock_tab = bool(self.locktab_var.get())
             if not allowed and not lock_tab:
-                self.set_error("Study mode needs at least one allowed app, or a locked Chrome tab.")
+                self.set_message("Study mode needs at least one allowed app, or a locked Chrome tab.")
                 return
 
-        save_settings({"minutes": self.minutes_var.get(), "mode": mode,
-                       "locktab": bool(self.locktab_var.get()),
-                       "exact": bool(self.exact_var.get()),
-                       "extra": ", ".join(sorted(allowed))})
+        self.settings = {"minutes": self.minutes_var.get().strip(), "mode": mode,
+                         "locktab": bool(self.locktab_var.get()),
+                         "exact": bool(self.exact_var.get()),
+                         "apps": apps, "extra": extra,
+                         "breaks": self.breaks_var.get(),
+                         "break_minutes": self.break_min_var.get()}
+        save_settings(self.settings)
 
-        if lock_tab:
-            self.set_error("Locking your Chrome tab...", MUTED)
-            self.start_btn.config(state="disabled")
-            self.update()
-            if not self.tabsrv.begin(self.exact_var.get()):
-                self.start_btn.config(state="normal")
-                self.set_error("Couldn't open local port %d. Is another copy of "
-                               "Focus Lock already running?" % TAB_PORT)
-                return
-            err = self.wait_for_tab_lock()
-            if err:
-                self.tabsrv.end()
-                self.start_btn.config(state="normal")
-                self.set_error(err)
-                return
-            allowed.add("chrome.exe")
+        params = {"minutes": minutes, "mode": mode, "allowed": allowed, "lock_tab": lock_tab,
+                  "breaks": self.breaks_var.get(), "break_minutes": self.break_min_var.get()}
+        if not lock_tab:
+            self.begin_session(params)
+            return
 
-        self.allowed = allowed
-        self.tab_locked = lock_tab
-        self.full_lock = (mode == "full")
-        self.total_seconds = int(minutes * 60)
-        self.end_time = time.monotonic() + self.total_seconds
-        self.locked = True
+        if not self.port_ok and not self.tabsrv.start():
+            self.set_message("Couldn't open local port %d, so Chrome can't be reached. Is "
+                             "another program using it?" % TAB_PORT)
+            return
+        self.port_ok = True
+        if self.tabsrv.connected() and self.tabsrv.ext.get("incognito") is False:
+            self.set_message("Allow Focus Lock in Incognito first, otherwise a private window "
+                             "gets around the tab lock. Use 'Open extension settings' above, "
+                             "switch on 'Allow in Incognito', then press Start again.")
+            return
+        gen = self.new_phase("starting")
+        self.tabsrv.begin(self.exact_var.get())
+        self.start_btn.set_enabled(False)
+        self.start_btn.set_text("Locking your Chrome tab")
+        self.set_message("Waiting for Chrome...", MUTED)
+        self.cancel_btn.pack(side="left", padx=(px(8), 0))
+        self.after(100, self._await_tab_lock, gen, time.monotonic(), params, 0)
+
+    def _await_tab_lock(self, gen, t0, params, n):
+        """Polls (without blocking the UI) until the extension confirms the lock."""
+        if gen != self.gen:
+            return
+        st = self.tabsrv.status
+        if st.get("locked"):
+            params["allowed"].add("chrome.exe")
+            self.begin_session(params)
+            return
+        if st.get("error"):
+            self._start_failed(st["error"])
+            return
+        if time.monotonic() - t0 > 10:
+            if self.tabsrv.connected():
+                why = ("Chrome didn't confirm the lock. Click the Focus Lock icon in Chrome "
+                       "and press Start again.")
+            else:
+                why = ("Chrome didn't respond. Make sure Chrome is open and the Focus Lock "
+                       "extension is installed (use 'Install extension').")
+            self._start_failed(why)
+            return
+        self.start_btn.set_text("Locking your Chrome tab" + "." * (n // 4 % 4))
+        self.after(100, self._await_tab_lock, gen, t0, params, n + 1)
+
+    def _start_failed(self, text, color=DANGER):
+        self.tabsrv.end()
+        self.new_phase("setup")
+        self.start_btn.set_text("Start focus")
+        self.start_btn.set_enabled(True)
+        self.cancel_btn.pack_forget()
+        self.set_message(text, color)
+
+    def cancel_start(self):
+        if self.phase == "starting":
+            self._start_failed("Cancelled.", color=MUTED)
+
+    def begin_session(self, p):
+        self.allowed = p["allowed"]
+        self.tab_locked = p["lock_tab"]
+        self.full_lock = p["mode"] == "full"
+        self.total_seconds = max(1, int(p["minutes"] * 60))
+        self.remaining = float(self.total_seconds)
+        self.breaks_total = self.breaks_left = int(p["breaks"])
+        self.break_secs = int(p["break_minutes"]) * 60
+        self.session_focus = 0.0
+        self.enter_focus()
+
+    # ---- focus -------------------------------------------------------------
+    def enter_focus(self):
+        gen = self.new_phase("focus")
+        self.release_window()
         self.clear()
+        self.end_time = time.monotonic() + self.remaining
+        self.seg_start = time.monotonic()
+        self.tabsrv.paused = False      # the extension re-locks and returns to the study tab
+        self._break_armed_until = 0.0
 
         if self.full_lock:
             self.enter_full_lock()
@@ -1055,137 +2274,278 @@ class FocusLock(tk.Tk):
             self.enter_study_bar()
 
         self.blocker.block_alt_tab = self.full_lock
-        self.blocker.lock_chrome = lock_tab
+        self.blocker.lock_chrome = self.tab_locked
         self.blocker.start()
 
-        self.tick()
+        self.tick(gen)
         if self.full_lock:
-            self.keep_focus()
+            self.keep_focus(gen)
         else:
-            self.guard_tick()
+            self.guard_tick(gen)
 
-    # ---- lock screens ------------------------------------------------------
+    def _break_button(self, parent, size, small):
+        if not self.breaks_total:
+            return None
+        b = RoundButton(parent, "", self.on_break_click, kind="secondary", size=size,
+                        padx=12 if small else 20, pady=5 if small else 9)
+        self._reset_break_button(b, small)
+        return b
+
+    def _reset_break_button(self, b, small):
+        if not b or not b.winfo_exists():
+            return
+        if self.breaks_left:
+            text = ("Break (%d left)" if small else "Take a break  ·  %d left") % self.breaks_left
+            b.set_text(text)
+            b.set_enabled(True)
+        else:
+            b.set_text("No breaks left")
+            b.set_enabled(False)
+
+    def on_break_click(self):
+        """First click arms, second click (within 4 s) starts the break."""
+        if self.phase != "focus" or not self.breaks_left:
+            return
+        now = time.monotonic()
+        if now < self._break_armed_until:
+            self.take_break()
+            return
+        self._break_armed_until = now + 4
+        mins = self.break_secs // 60
+        self.break_btn.set_text("Click again for a %d-min break" % mins)
+        gen, small = self.gen, not self.full_lock
+        self.after(4000, lambda: gen == self.gen and self._reset_break_button(self.break_btn, small))
+
     def enter_full_lock(self):
-        px, py, pw, ph = self.primary_monitor()
+        px_, py_, pw, ph = self.primary_monitor()
         self.resizable(True, True)
-        self.geometry("+%d+%d" % (px, py))
+        self.geometry("+%d+%d" % (px_, py_))
         self.update_idletasks()
-        self.attributes("-fullscreen", True)
-        self.attributes("-topmost", True)
+        self.wm_attr(self, "-fullscreen", True)
+        self.wm_attr(self, "-topmost", True)
         self.bind("<Alt-F4>", lambda e: "break")
         self.bind("<Escape>", lambda e: "break")
 
         c = self.container
-        lbl(c, "FOCUS", 20, MUTED, bold=True).pack(pady=(60, 0))
-        self.time_lbl = tk.Label(c, text="00:00", bg=BG, fg=FG, font=(FONT, 120, "bold"))
-        self.time_lbl.pack(expand=True)
-        self.bar = tk.Canvas(c, height=10, bg=PANEL, highlightthickness=0)
-        self.bar.pack(fill="x", padx=160, pady=30)
-        lbl(c, "Stay on this screen. You've got this.", 14, MUTED).pack()
-        self.exit_frame = tk.Frame(c, bg=BG)
-        self.exit_frame.pack(side="bottom", pady=30)
-        self.exit_btn = tk.Button(
-            self.exit_frame, text="End early", bg=BG, fg=MUTED, activebackground=BG,
-            activeforeground=DANGER, relief="flat", bd=0, font=(FONT, 10),
-            cursor="hand2", command=self.show_quit_prompt)
-        self.exit_btn.pack()
+        center = tk.Frame(c, bg=BG)
+        center.place(relx=0.5, rely=0.48, anchor="center")
+        size = int(min(ph * 0.56, pw * 0.42))
+        label(center, "F O C U S", 12, SUBTLE, "bold").pack(pady=(0, px(20)))
+        self.ring = Ring(center, size, max(px(10), int(size * 0.035)), ticks=60,
+                         sub_px=max(px(12), int(size * 0.042)))
+        self.ring.pack()
+        label(center, "Stay on this screen. You've got this.", 13, MUTED).pack(pady=(px(28), px(16)))
+        self.actions = tk.Frame(center, bg=BG)
+        self.actions.pack()
+        self.break_btn = self._break_button(self.actions, 11, small=False)
+        if self.break_btn:
+            self.break_btn.pack(side="left", padx=(0, px(10)))
+        RoundButton(self.actions, "End early", self.show_quit_prompt, kind="ghost", size=10,
+                    hover_fg=DANGER, padx=18, pady=9).pack(side="left")
+        self.exit_frame = tk.Frame(center, bg=BG)
+        self.exit_frame.pack()
+        self._show_actions = lambda: self.actions.pack(before=self.exit_frame)
 
-        # black covers on every other monitor
+        # black covers on every other monitor, with a quiet copy of the timer
         for (x, y, w, h) in get_monitors():
-            if (x, y) == (px, py):
+            if (x, y) == (px_, py_):
                 continue
             top = tk.Toplevel(self)
             top.configure(bg="black")
             top.overrideredirect(True)
             top.geometry("%dx%d+%d+%d" % (w, h, x, y))
             top.attributes("-topmost", True)
-            tk.Label(top, text="FOCUS", bg="black", fg=PANEL,
-                     font=(FONT, 28, "bold")).place(relx=0.5, rely=0.5, anchor="center")
+            box = tk.Frame(top, bg="black")
+            box.place(relx=0.5, rely=0.5, anchor="center")
+            tk.Label(box, text="F O C U S", bg="black", fg=PANEL,
+                     font=(FONT, 16, "bold")).pack()
+            t = tk.Label(box, text="", bg="black", fg="#334155", font=(FONT, 40, "bold"))
+            t.pack()
+            self.cover_labels.append(t)
             top.bind("<Alt-F4>", lambda e: "break")
             self.covers.append(top)
         self.focus_force()
 
-    def enter_study_bar(self):
-        px, py, pw, ph = self.primary_monitor()
-        self.resizable(False, False)
-        self.attributes("-toolwindow", True)   # small title bar, no minimise button
-        self.attributes("-topmost", True)
+    def _bar(self, ring_color):
+        """Compact top-of-screen window used for Study mode and breaks."""
+        self.wm_attr(self, "-toolwindow", True)    # small title bar, no minimise button
+        self.wm_attr(self, "-topmost", True)
         c = self.container
-        c.configure(padx=14, pady=6)
-        self.time_lbl = tk.Label(c, text="00:00", bg=BG, fg=FG, font=(FONT, 26, "bold"))
-        self.time_lbl.pack()
-        self.bar = tk.Canvas(c, height=6, width=200, bg=PANEL, highlightthickness=0)
-        self.bar.pack(fill="x", pady=(2, 4))
+        c.configure(padx=px(14), pady=px(12))
+        row = tk.Frame(c, bg=BG)
+        row.pack(anchor="w")
+        self.ring = Ring(row, px(86), px(6), color=ring_color, ticks=12, time_px=px(14))
+        self.ring.pack(side="left")
+        col = tk.Frame(row, bg=BG)
+        col.pack(side="left", padx=(px(14), 0))
         self.exit_frame = tk.Frame(c, bg=BG)
-        self.exit_frame.pack()
-        self.exit_btn = tk.Button(
-            self.exit_frame, text="End early", bg=BG, fg=MUTED, activebackground=BG,
-            activeforeground=DANGER, relief="flat", bd=0, font=(FONT, 9),
-            cursor="hand2", command=self.show_quit_prompt)
-        self.exit_btn.pack()
-        self.update_idletasks()
-        x = px + (pw - self.winfo_reqwidth()) // 2
-        self.geometry("+%d+%d" % (x, py + 6))
+        self.exit_frame.pack(anchor="w")
+        return col
 
+    def enter_study_bar(self):
+        col = self._bar(ACCENT)
+        label(col, "Study mode", 11, FG, "bold").pack(anchor="w")
+        self.bar_status = label(col, "", 9, MUTED)
+        self.bar_status.pack(anchor="w")
+        self.actions = tk.Frame(col, bg=BG)
+        self.actions.pack(anchor="w", pady=(px(8), 0))
+        self.break_btn = self._break_button(self.actions, 9, small=True)
+        if self.break_btn:
+            self.break_btn.pack(side="left", padx=(0, px(6)))
+        RoundButton(self.actions, "End early", self.show_quit_prompt, kind="ghost", size=9,
+                    hover_fg=DANGER, padx=12, pady=5).pack(side="left")
+        self._show_actions = lambda: self.actions.pack(anchor="w", pady=(px(8), 0))
+        self.update_bar_status()
+        self.place_top_center()
+
+    def update_bar_status(self):
+        if self.tab_locked:
+            if time.time() - self.tabsrv.status_at < 6:
+                text, color = "●  Chrome tab locked", GOOD
+            else:
+                text, color = "●  Waiting for Chrome...", WARN
+        else:
+            n = len(self.allowed)
+            text, color = "●  %s allowed" % plural(n, "app"), MUTED
+        try:
+            self.bar_status.configure(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+    # ---- quitting early ----------------------------------------------------
     def show_quit_prompt(self):
-        self.exit_btn.pack_forget()
-        wrap = 700 if self.full_lock else 250
-        tk.Label(self.exit_frame, text='To quit, type:\n"%s"\nthen press Enter' % QUIT_PHRASE,
-                 bg=BG, fg=DANGER, font=(FONT, 11 if self.full_lock else 9),
-                 wraplength=wrap).pack(pady=(0, 6))
-        self.quit_entry = tk.Entry(
-            self.exit_frame, width=36 if self.full_lock else 30, justify="center",
-            font=(FONT, 13 if self.full_lock else 10), bg=PANEL, fg=FG,
-            insertbackground=FG, relief="flat")
-        self.quit_entry.pack(ipady=6)
+        if self.quit_entry is not None:
+            return
+        self.actions.pack_forget()
+        big = self.full_lock and self.phase == "focus"
+        f = self.exit_frame
+        label(f, 'To quit, type  "%s"  and press Enter' % QUIT_PHRASE,
+              11 if big else 9, DANGER, wraplength=px(700 if big else 300),
+              justify="center").pack(pady=(px(10), px(8)))
+        self.quit_box = RoundEntry(f, tk.StringVar(), px(380 if big else 300),
+                                   size=13 if big else 10, justify="center")
+        self.quit_box.pack()
+        self.quit_entry = self.quit_box.entry
         self.quit_entry.bind("<Return>", self.check_quit_phrase)
+        self.quit_entry.bind("<Escape>", lambda e: (self.cancel_quit_prompt(), "break")[1])
+        RoundButton(f, "Never mind", self.cancel_quit_prompt, kind="ghost",
+                    size=9, padx=12, pady=4).pack(pady=(px(8), 0))
         self.quit_entry.focus_force()
+        if not self.full_lock or self.phase == "break":
+            self.geometry("")
+
+    def cancel_quit_prompt(self):
+        self.quit_entry = None
+        for w in self.exit_frame.winfo_children():
+            w.destroy()
+        self._show_actions()
+        if not self.full_lock or self.phase == "break":
+            self.geometry("")
 
     def check_quit_phrase(self, _event=None):
         if self.quit_entry and self.quit_entry.get().strip().lower() == QUIT_PHRASE:
-            self.unlock()
-            self.show_finished(completed=False)
+            self.finish(completed=False)
+        elif self.quit_entry:
+            self.quit_box._set(error=True)
+
+    # ---- breaks ------------------------------------------------------------
+    def take_break(self):
+        if self.phase != "focus" or self.breaks_left <= 0:
+            return
+        self.credit_focus(stop=True)
+        self.remaining = max(1.0, self.end_time - time.monotonic())
+        self.breaks_left -= 1
+        gen = self.new_phase("break")
+        self.blocker.stop()
+        self.tabsrv.paused = True           # extension stops enforcing until we resume
+        self.release_window()
+        self.clear()
+        self.break_end = time.monotonic() + self.break_secs
+
+        col = self._bar(WARN)
+        label(col, "On a break", 11, WARN, "bold").pack(anchor="w")
+        label(col, "Everything is unlocked. Focus resumes by itself.", 9, MUTED).pack(anchor="w")
+        self.break_info = label(col, "", 9, SUBTLE)
+        self.break_info.pack(anchor="w")
+        self.actions = tk.Frame(col, bg=BG)
+        self.actions.pack(anchor="w", pady=(px(8), 0))
+        RoundButton(self.actions, "Resume now", self.resume_focus, kind="warn", size=9,
+                    padx=12, pady=5).pack(side="left", padx=(0, px(6)))
+        RoundButton(self.actions, "End session", self.show_quit_prompt, kind="ghost", size=9,
+                    hover_fg=DANGER, padx=12, pady=5).pack(side="left")
+        self._show_actions = lambda: self.actions.pack(anchor="w", pady=(px(8), 0))
+        self.place_top_center()
+        self.break_tick(gen)
+
+    def break_tick(self, gen):
+        if gen != self.gen:
+            return
+        left = self.break_end - time.monotonic()
+        if left <= 0:
+            self.resume_focus()
+            return
+        self.ring.set(left / self.break_secs, fmt_clock(left))
+        info = "%s of focus left" % fmt_clock(self.remaining)
+        if self.breaks_left:
+            info += "  ·  %s after this" % plural(self.breaks_left, "break")
+        if left <= 30:
+            info = "Locking again in %d s" % math.ceil(left)
+        try:
+            self.break_info.configure(text=info, fg=WARN if left <= 30 else SUBTLE)
+        except tk.TclError:
+            pass
+        self.after(200, self.break_tick, gen)
+
+    def resume_focus(self):
+        if self.phase != "break":
+            return
+        self.chime("resume")
+        self.enter_focus()
 
     # ---- loops -------------------------------------------------------------
-    def tick(self):
-        if not self.locked:
+    def tick(self, gen):
+        if gen != self.gen:
             return
-        remaining = self.end_time - time.monotonic()
+        now = time.monotonic()
+        remaining = self.end_time - now
         if remaining <= 0:
-            self.unlock()
-            self.beep()
-            self.show_finished(completed=True)
+            self.finish(completed=True)
             return
-        secs = int(remaining + 0.999)
-        self.time_lbl.config(text="%02d:%02d" % (secs // 60, secs % 60))
-        w = self.bar.winfo_width()
-        h = int(self.bar.cget("height"))
-        done = 1 - remaining / self.total_seconds
-        self.bar.delete("all")
-        self.bar.create_rectangle(0, 0, w * done, h, fill=ACCENT, width=0)
-        self.after(200, self.tick)
+        if now - self.seg_start >= 30:
+            self.credit_focus()         # save progress regularly
+        text = fmt_clock(remaining)
+        if self.full_lock:
+            ends = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+            self.ring.set(remaining / self.total_seconds, text, "ends at %s" % ends,
+                          top="REMAINING")
+            for lab in self.cover_labels:
+                lab.configure(text=text)
+        else:
+            self.ring.set(remaining / self.total_seconds, text)
+            self.update_bar_status()
+        self.after(200, self.tick, gen)
 
-    def keep_focus(self):
+    def keep_focus(self, gen):
         """Full lock: stay on top of everything, except Task Manager."""
-        if not self.locked:
+        if gen != self.gen:
             return
         windows = [self] + self.covers
         if foreground_exe() == "taskmgr.exe":
             for w in windows:                      # step aside so you can end us
-                w.attributes("-topmost", False)
+                self.wm_attr(w, "-topmost", False)
         else:
             for w in windows:
-                w.attributes("-topmost", True)
+                self.wm_attr(w, "-topmost", True)
                 w.lift()
             if self.focus_displayof() is None:
                 self.focus_force()
                 if self.quit_entry is not None and self.quit_entry.winfo_exists():
                     self.quit_entry.focus_force()
-        self.after(250, self.keep_focus)
+        self.after(250, self.keep_focus, gen)
 
-    def guard_tick(self):
+    def guard_tick(self, gen):
         """Study mode: minimise anything that isn't allowed."""
-        if not self.locked:
+        if gen != self.gen:
             return
         chrome_visible = False
         for hwnd, _pid, exe, _title in list_app_windows(exclude_pids={os.getpid()}):
@@ -1195,9 +2555,9 @@ class FocusLock(tk.Tk):
                 continue
             minimize_window(hwnd)
         self.revive_chrome(chrome_visible)
-        self.attributes("-topmost", True)
+        self.wm_attr(self, "-topmost", True)
         self.lift()
-        self.after(300, self.guard_tick)
+        self.after(300, self.guard_tick, gen)
 
     def revive_chrome(self, chrome_visible):
         """If Chrome was closed entirely (so the extension can't react), reopen the page."""
@@ -1215,59 +2575,68 @@ class FocusLock(tk.Tk):
                 pass
 
     # ---- ending ------------------------------------------------------------
-    def unlock(self):
-        self.locked = False
-        self.quit_entry = None
+    def finish(self, completed):
+        if self.phase == "focus":
+            self.credit_focus(stop=True)
+        self.seg_start = None
+        self.new_phase("done")
         self.blocker.stop()
         self.blocker.lock_chrome = False
         self.tabsrv.end()                 # extension unlocks Chrome within ~1 second
         self.tab_locked = False
-        for cv in self.covers:
-            cv.destroy()
-        self.covers = []
-        self.unbind("<Alt-F4>")
-        self.unbind("<Escape>")
-        self.attributes("-topmost", False)
-        self.attributes("-fullscreen", False)
-        self.attributes("-toolwindow", False)
-        self.container.configure(padx=0, pady=0)
-
-    def beep(self):
-        try:
-            import winsound
-            for freq in (660, 880, 1100):
-                winsound.Beep(freq, 180)
-        except Exception:
-            self.bell()
+        self.release_window()
+        if completed:
+            self.chime("done")
+        self.show_finished(completed)
 
     def show_finished(self, completed):
         self.clear()
-        self.resizable(False, False)
-        self.geometry("")
-        c = self.container
-        tk.Frame(c, width=460, height=1, bg=BG).pack()
+        outer = tk.Frame(self.container, bg=BG, padx=px(40), pady=px(34))
+        outer.pack()
+        tk.Frame(outer, width=px(420), height=1, bg=BG).pack()
+        focused = min(self.session_focus, self.total_seconds)
+        ring = Ring(outer, px(190), px(11), color=GOOD if completed else ACCENT, ticks=60,
+                    time_px=px(36), sub_px=px(12))
+        ring.set(1.0 if completed else focused / max(1, self.total_seconds),
+                 fmt_clock(focused), "focused")
+        ring.pack()
         if completed:
-            lbl(c, "Session complete", 24, GOOD, bold=True).pack(pady=(60, 8))
-            lbl(c, "Nice work. Take a short break.", 12, MUTED).pack(pady=(0, 30))
+            label(outer, "Session complete", 22, GOOD, "bold").pack(pady=(px(18), px(4)))
+            label(outer, "Nice work. Take a short break.", 11, MUTED).pack()
         else:
-            lbl(c, "Session ended early", 22, DANGER, bold=True).pack(pady=(60, 8))
-            lbl(c, "No worries. Try again when you're ready.", 12, MUTED).pack(pady=(0, 30))
-        btn(c, "Another session", self.show_setup, size=12).pack(pady=6)
-        btn(c, "Close", self.on_close, color="#475569", fg=FG, size=12).pack(pady=(6, 50))
+            label(outer, "Session ended early", 20, DANGER, "bold").pack(pady=(px(18), px(4)))
+            label(outer, "No worries. Try again when you're ready.", 11, MUTED).pack()
+        label(outer, "Today %s   ·   Streak %s" % (
+            fmt_duration(self.stats.today()), plural(self.stats.streak(), "day")),
+            10, SUBTLE).pack(pady=(px(14), px(22)))
+        row = tk.Frame(outer, bg=BG)
+        row.pack()
+        RoundButton(row, "Another session", self.show_setup, size=11).pack(side="left", padx=px(5))
+        RoundButton(row, "Close", self.on_close, kind="secondary", size=11).pack(side="left", padx=px(5))
+        self.bind("<Return>", lambda e: self.show_setup() if self.phase == "done" else None)
         self.center_on_primary()
 
 
-if __name__ == "__main__":
-    if not IS_WINDOWS:
+def main():
+    if not IS_WINDOWS and not os.environ.get("FOCUSLOCK_DEV"):
         print("Focus Lock only runs on Windows.")
         sys.exit(1)
-    try:  # keep Tk and Win32 coordinates in the same pixel space
-        ctypes.WinDLL("shcore").SetProcessDpiAwareness(1)
-    except Exception:
-        try:
-            user32.SetProcessDPIAware()
+    if IS_WINDOWS:
+        if not acquire_single_instance():
+            if not activate_existing_instance():
+                user32.MessageBoxW(None, "Focus Lock is already running.", APP_TITLE, 0x40)
+            sys.exit(0)
+        try:  # keep Tk and Win32 coordinates in the same pixel space
+            ctypes.WinDLL("shcore").SetProcessDpiAwareness(1)
         except Exception:
-            pass
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
     app = FocusLock()
     atexit.register(app.shutdown)
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

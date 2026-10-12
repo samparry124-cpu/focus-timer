@@ -1,7 +1,8 @@
 """
-Focus Lock v4 - a Windows study timer that is hard to escape.
+Focus Lock v4 - a study timer for Windows and macOS that is hard to escape.
 
 Run:   python focus_lock.py          (Windows, Python 3.8+, no extra installs)
+       python3 focus_lock.py         (macOS 12+, Python from python.org - see MAC below)
 
 TWO MODES
   Full lock   Black screen + clock-style timer on EVERY monitor. Nothing else
@@ -44,10 +45,25 @@ CHROME TAB LOCK (Study mode)
   extension must be allowed in Incognito, otherwise a private window would be
   a way around the lock. The start screen shows whether it is connected.
 
+MAC
+  Use Python from python.org (Apple's built-in python3 has an outdated Tk).
+  Run "python3 focus_lock.py --check" once: it tries every Mac feature and
+  prints what works.
+  - Full lock hides the Dock and menu bar and turns off Cmd+Tab (kiosk mode).
+    Force Quit (Cmd+Option+Esc) stays available as the emergency exit, and the
+    lock steps aside while it is open.
+  - Study mode hides apps you haven't allowed (like Cmd+H). Finder, Activity
+    Monitor and the Terminal you started from are never hidden. Type app names
+    as they appear in the Dock, e.g. "Notion, Spotify".
+  - Spotify is controlled through AppleScript. The first time, macOS asks
+    whether your Terminal may control Spotify - click OK.
+  - Keyboard blocking (Win key etc.) is Windows-only; the Chrome tab lock works
+    the same through the extension.
+
 EMERGENCY EXITS (deliberately left open so you can never be trapped)
   - Click "End early" and type the phrase.
-  - Ctrl+Alt+Del -> Task Manager. While Task Manager is in front, Full lock
-    steps aside so you can end it.
+  - Ctrl+Alt+Del -> Task Manager (Mac: Cmd+Option+Esc -> Force Quit). While
+    it is in front, Full lock steps aside so you can end it.
   - If this program dies, Chrome unlocks itself ~10 seconds later and the
     keyboard hook disappears with the process.
 """
@@ -89,7 +105,6 @@ WARN_HI = "#fcd34d"
 DANGER = "#f87171"
 INK = "#0b1120"          # text on bright fills
 FONT = "Segoe UI"        # on a Mac, replaced by the system font when the app starts
-FONT_SCALE = 1.0         # Tk on a Mac renders points at 72 dpi; scaled up there to match
 
 QUIT_PHRASE = "i am choosing to be distracted"
 PRESETS = [15, 25, 45, 60]
@@ -108,8 +123,11 @@ def px(n):
 
 
 def fs(size):
-    """Font size in points (negative = pixels, left alone)."""
-    return size if size < 0 else int(round(size * FONT_SCALE))
+    """Font size: points on Windows. On a Mac, Tk 8.6 renders points at 72 dpi and Tk 9 at
+    96, so use the pixel size Windows would draw (negative = pixels) to look the same."""
+    if IS_MAC and size > 0:
+        return -int(round(size * 96 / 72.0))
+    return size
 
 
 def font(size, weight="normal"):
@@ -558,7 +576,481 @@ if IS_WINDOWS:
                 continue
         return False
 
-else:  # lets the logic be imported/tested off-Windows
+# ============================================================================
+#  macOS backend: Cocoa / CoreGraphics through ctypes (nothing to install)
+#  Every call here must run on the Tk main thread, after tk.Tk() exists.
+# ============================================================================
+elif IS_MAC:
+    import ctypes
+    import ctypes.util
+    import queue
+    import re
+    from ctypes import (POINTER, Structure, byref, c_bool, c_char_p, c_double, c_int32,
+                        c_long, c_uint32, c_ulong, c_void_p, sizeof)
+
+    def _load(path, short):
+        try:
+            return ctypes.CDLL(path)             # dlopen also searches the dyld shared cache
+        except OSError:
+            found = ctypes.util.find_library(short)
+            if not found:
+                raise
+            return ctypes.CDLL(found)
+
+    _objc = _load("/usr/lib/libobjc.A.dylib", "objc")
+    _load("/System/Library/Frameworks/AppKit.framework/AppKit", "AppKit")
+    _cg = _load("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", "CoreGraphics")
+    _cf = _load("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+                "CoreFoundation")
+
+    _objc.objc_getClass.restype, _objc.objc_getClass.argtypes = c_void_p, [c_char_p]
+    _objc.sel_registerName.restype, _objc.sel_registerName.argtypes = c_void_p, [c_char_p]
+    _objc.objc_autoreleasePoolPush.restype, _objc.objc_autoreleasePoolPush.argtypes = c_void_p, []
+    _objc.objc_autoreleasePoolPop.restype, _objc.objc_autoreleasePoolPop.argtypes = None, [c_void_p]
+    _MSGSEND = ctypes.cast(_objc.objc_msgSend, c_void_p).value
+
+    class CGPoint(Structure):
+        _fields_ = [("x", c_double), ("y", c_double)]
+
+    class CGSize(Structure):
+        _fields_ = [("width", c_double), ("height", c_double)]
+
+    class CGRect(Structure):
+        _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+    _cg.CGGetActiveDisplayList.restype = c_int32
+    _cg.CGGetActiveDisplayList.argtypes = [c_uint32, POINTER(c_uint32), POINTER(c_uint32)]
+    _cg.CGDisplayBounds.restype, _cg.CGDisplayBounds.argtypes = CGRect, [c_uint32]
+    _cg.CGWindowListCopyWindowInfo.restype = c_void_p
+    _cg.CGWindowListCopyWindowInfo.argtypes = [c_uint32, c_uint32]
+    _cf.CFArrayGetCount.restype, _cf.CFArrayGetCount.argtypes = c_long, [c_void_p]
+    _cf.CFArrayGetValueAtIndex.restype = c_void_p
+    _cf.CFArrayGetValueAtIndex.argtypes = [c_void_p, c_long]
+    _cf.CFDictionaryGetValue.restype = c_void_p
+    _cf.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
+    _cf.CFStringGetCString.restype = c_bool
+    _cf.CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+    _cf.CFNumberGetValue.restype = c_bool
+    _cf.CFNumberGetValue.argtypes = [c_void_p, c_long, c_void_p]
+    _cf.CFRelease.restype, _cf.CFRelease.argtypes = None, [c_void_p]
+    _kOwnerName = c_void_p.in_dll(_cg, "kCGWindowOwnerName").value     # no permission needed
+    _kWindowNumber = c_void_p.in_dll(_cg, "kCGWindowNumber").value
+
+    _sels, _classes, _senders = {}, {}, {}
+
+    def _sel(name):
+        s = _sels.get(name)
+        if s is None:
+            s = _sels[name] = _objc.sel_registerName(name.encode("ascii"))
+        return s
+
+    def _cls(name):
+        c = _classes.get(name)
+        if c is None:
+            c = _classes[name] = _objc.objc_getClass(name.encode("ascii"))
+        return c
+
+    def msg(obj, selector, *args, restype=c_void_p, argtypes=()):
+        """[obj selector...] through an exact, non-variadic objc_msgSend prototype (arm64 needs
+        that). argtypes must describe every argument after _cmd."""
+        argtypes = tuple(argtypes)
+        if len(args) != len(argtypes):
+            raise TypeError("%s: %d args, %d argtypes" % (selector, len(args), len(argtypes)))
+        key = (restype, argtypes)
+        fn = _senders.get(key)
+        if fn is None:
+            fn = _senders[key] = ctypes.CFUNCTYPE(restype, c_void_p, c_void_p, *argtypes)(_MSGSEND)
+        return fn(obj, _sel(selector), *args)
+
+    class _Pool:
+        def __enter__(self):
+            self.p = _objc.objc_autoreleasePoolPush()
+
+        def __exit__(self, *exc):
+            _objc.objc_autoreleasePoolPop(self.p)
+            return False
+
+    def _pystr(ns):
+        if not ns:
+            return ""
+        b = msg(ns, "UTF8String", restype=c_char_p)
+        return b.decode("utf-8", "replace") if b else ""
+
+    def _items(arr):
+        if not arr:
+            return
+        for i in range(msg(arr, "count", restype=c_ulong)):
+            yield msg(arr, "objectAtIndex:", i, argtypes=(c_ulong,))
+
+    def _responds(obj, selector):
+        return bool(obj) and bool(msg(obj, "respondsToSelector:", _sel(selector),
+                                      restype=c_bool, argtypes=(c_void_p,)))
+
+    # ---- kiosk mode (NSApplicationPresentationOptions) ---------------------
+    PO_AUTOHIDE_DOCK, PO_HIDE_DOCK, PO_AUTOHIDE_MENUBAR, PO_HIDE_MENUBAR = 1, 2, 4, 8
+    PO_DISABLE_APPLE_MENU, PO_DISABLE_PROCESS_SWITCHING, PO_DISABLE_FORCE_QUIT = 16, 32, 64
+    PO_DISABLE_SESSION_TERMINATION, PO_DISABLE_HIDE_APPLICATION = 128, 256
+    # Force Quit (Cmd+Opt+Esc) and the power button deliberately stay available.
+    LOCK_OPTIONS = (PO_HIDE_DOCK | PO_HIDE_MENUBAR | PO_DISABLE_APPLE_MENU |
+                    PO_DISABLE_PROCESS_SWITCHING | PO_DISABLE_HIDE_APPLICATION)      # 314
+
+    def presentation_valid(o):
+        """Apple's rules; breaking them raises an Objective-C exception, which would kill us."""
+        dock = o & (PO_HIDE_DOCK | PO_AUTOHIDE_DOCK)
+        if (o & PO_AUTOHIDE_DOCK) and (o & PO_HIDE_DOCK):
+            return False
+        if (o & PO_AUTOHIDE_MENUBAR) and (o & PO_HIDE_MENUBAR):
+            return False
+        if (o & PO_HIDE_MENUBAR) and not (o & PO_HIDE_DOCK):
+            return False
+        if (o & PO_AUTOHIDE_MENUBAR) and not dock:
+            return False
+        if (o & (PO_DISABLE_PROCESS_SWITCHING | PO_DISABLE_FORCE_QUIT |
+                 PO_DISABLE_SESSION_TERMINATION | 512)) and not dock:
+            return False
+        return not (o & (1024 | 2048))             # full-screen bits belong to AppKit
+
+    def _nsapp():
+        return msg(_cls("NSApplication"), "sharedApplication")
+
+    def set_presentation(options):
+        if not presentation_valid(options):
+            raise ValueError("invalid presentation options %#x" % options)
+        with _Pool():
+            msg(_nsapp(), "setPresentationOptions:", options, restype=None, argtypes=(c_ulong,))
+
+    def current_presentation():
+        with _Pool():
+            return msg(_nsapp(), "currentSystemPresentationOptions", restype=c_ulong)
+
+    def activate_self():
+        with _Pool():
+            app = _nsapp()
+            if _responds(app, "activateIgnoringOtherApps:"):   # still what Tk itself uses
+                msg(app, "activateIgnoringOtherApps:", True, restype=None, argtypes=(c_bool,))
+            elif _responds(app, "activate"):
+                msg(app, "activate", restype=None)
+
+    # ---- windows: level + Spaces behaviour ---------------------------------
+    LEVEL_NORMAL, LEVEL_STATUS, LEVEL_LOCK = 0, 25, 26     # 26 = above the menu bar
+    # CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
+    CB_EVERYWHERE = 1 | 16 | 64 | 256
+
+    def nswindow(win):
+        """NSWindow* behind a Tk toplevel (None until it has been mapped)."""
+        try:
+            win.update_idletasks()
+            ident = win.winfo_id()
+        except tk.TclError:
+            return None
+        if not ident:
+            return None
+        # winfo_id() is Tk's MacDrawable*; its second field is the contentView (Tk 8.6 and 9)
+        view = c_void_p.from_address(ident + sizeof(c_void_p)).value
+        nsw = msg(view, "window") if view else None
+        if nsw and msg(nsw, "isKindOfClass:", _cls("NSWindow"), restype=c_bool,
+                       argtypes=(c_void_p,)):
+            return nsw
+        title = win.title()                         # fallback: find it by its (unique) title
+        for w in _items(msg(_nsapp(), "windows")):
+            if _pystr(msg(w, "title")) == title:
+                return w
+        return None
+
+    def set_window_level(win, level, behavior=None, can_hide=None):
+        with _Pool():
+            nsw = nswindow(win)
+            if not nsw:
+                return False
+            if behavior is not None:
+                msg(nsw, "setCollectionBehavior:", behavior, restype=None, argtypes=(c_ulong,))
+            if can_hide is not None:
+                msg(nsw, "setCanHide:", can_hide, restype=None, argtypes=(c_bool,))
+                msg(nsw, "setHidesOnDeactivate:", False, restype=None, argtypes=(c_bool,))
+            msg(nsw, "setLevel:", level, restype=None, argtypes=(c_long,))
+            return True
+
+    def make_overlay(win):
+        set_window_level(win, LEVEL_STATUS, CB_EVERYWHERE, can_hide=False)
+
+    def keep_on_top(win):
+        set_window_level(win, LEVEL_STATUS)
+
+    def window_owner_numbers(owner=b"loginwindow"):
+        """Window numbers currently on screen that belong to `owner` (Force Quit lives in
+        loginwindow). Reading owner names needs no Screen Recording permission."""
+        arr = _cg.CGWindowListCopyWindowInfo(1 | 16, 0)   # on screen only, no desktop elements
+        found = set()
+        if not arr:
+            return found
+        try:
+            buf = ctypes.create_string_buffer(256)
+            num = ctypes.c_int64(0)
+            for i in range(_cf.CFArrayGetCount(arr)):
+                d = _cf.CFArrayGetValueAtIndex(arr, i)
+                s = _cf.CFDictionaryGetValue(d, _kOwnerName)
+                if s and _cf.CFStringGetCString(s, buf, 256, 0x08000100) and buf.value == owner:
+                    n = _cf.CFDictionaryGetValue(d, _kWindowNumber)
+                    if n and _cf.CFNumberGetValue(n, 4, byref(num)):    # kCFNumberSInt64Type
+                        found.add(num.value)
+        finally:
+            _cf.CFRelease(arr)
+        return found
+
+    # ---- displays ----------------------------------------------------------
+    def get_monitors():
+        """[(x, y, w, h)] in points; main display first at (0, 0) - same space as Tk."""
+        n = c_uint32(0)
+        if _cg.CGGetActiveDisplayList(0, None, byref(n)) != 0 or not n.value:
+            return []
+        ids = (c_uint32 * n.value)()
+        if _cg.CGGetActiveDisplayList(n.value, ids, byref(n)) != 0:
+            return []
+        out = []
+        for d in ids[:n.value]:
+            r = _cg.CGDisplayBounds(d)
+            out.append((int(r.origin.x), int(r.origin.y), int(r.size.width), int(r.size.height)))
+        return out
+
+    # ---- running apps ------------------------------------------------------
+    # Never hidden: system UI, Finder (hiding it makes macOS bounce focus around),
+    # Activity Monitor (the escape hatch) and the terminal that started us.
+    NEVER_HIDE = {
+        "com.apple.finder", "com.apple.activitymonitor", "com.apple.systempreferences",
+        "com.apple.loginwindow", "com.apple.dock", "com.apple.systemuiserver",
+        "com.apple.controlcenter", "com.apple.notificationcenterui", "com.apple.spotlight",
+        "com.apple.securityagent", "com.apple.coreservices.uiagent",
+        "com.apple.usernotificationcenter", "com.apple.terminal", "com.googlecode.iterm2",
+    }
+    _protected = None
+
+    def _protected_pids():
+        """Our own pid and every ancestor (Terminal / IDE that launched the script)."""
+        global _protected
+        if _protected is None:
+            pids = {os.getpid()}
+            try:
+                out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid="], capture_output=True,
+                                     text=True, timeout=5).stdout
+                parent = {}
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2:
+                        parent[int(parts[0])] = int(parts[1])
+                pid = os.getpid()
+                while pid in parent and pid > 1 and parent[pid] not in pids:
+                    pid = parent[pid]
+                    pids.add(pid)
+            except Exception:
+                pids.add(os.getppid())
+            _protected = pids
+        return _protected
+
+    def _regular_apps(include_hidden):
+        """[(app, pid, bundle_id, name)] for Dock apps; `app` is only valid inside the pool."""
+        out = []
+        ws = msg(_cls("NSWorkspace"), "sharedWorkspace")
+        for app in _items(msg(ws, "runningApplications")):
+            if msg(app, "activationPolicy", restype=c_long) != 0:       # Regular apps only
+                continue
+            if msg(app, "isTerminated", restype=c_bool):
+                continue
+            if not include_hidden and msg(app, "isHidden", restype=c_bool):
+                continue
+            out.append((app, msg(app, "processIdentifier", restype=c_int32),
+                        _pystr(msg(app, "bundleIdentifier")).lower(),
+                        _pystr(msg(app, "localizedName"))))
+        return out
+
+    def list_app_windows(exclude_pids=(), include_minimized=False):
+        """Mac version: one entry per running app -> (pid, pid, name, '')."""
+        with _Pool():
+            protected = _protected_pids()
+            return [(pid, pid, name.lower(), "")
+                    for _app, pid, bid, name in _regular_apps(include_minimized)
+                    if name and pid not in exclude_pids and pid not in protected
+                    and bid not in NEVER_HIDE]
+
+    def minimize_window(pid):
+        with _Pool():
+            app = msg(_cls("NSRunningApplication"), "runningApplicationWithProcessIdentifier:",
+                      pid, argtypes=(c_int32,))
+            if app:
+                msg(app, "hide", restype=c_bool)
+
+    def hide_disallowed(allowed):
+        """Study mode: hide every app that isn't allowed. Returns True if Chrome is running."""
+        chrome = False
+        with _Pool():
+            protected = _protected_pids()
+            for app, pid, bid, name in _regular_apps(include_hidden=True):
+                key = name.lower()
+                if bid == "com.google.chrome":
+                    chrome = True
+                if (pid in protected or bid in NEVER_HIDE or key in allowed or bid in allowed
+                        or key in ALWAYS_ALLOWED or msg(app, "isHidden", restype=c_bool)):
+                    continue
+                msg(app, "hide", restype=c_bool)
+        return chrome
+
+    def frontmost_app():
+        """(pid, bundle_id, lower-case name) of the app receiving key events."""
+        with _Pool():
+            app = msg(msg(_cls("NSWorkspace"), "sharedWorkspace"), "frontmostApplication")
+            if not app:
+                return None, "", ""
+            return (msg(app, "processIdentifier", restype=c_int32),
+                    _pystr(msg(app, "bundleIdentifier")).lower(),
+                    _pystr(msg(app, "localizedName")).lower())
+
+    def foreground_exe():
+        return frontmost_app()[2]
+
+    # ---- Spotify: AppleScript on one worker thread -------------------------
+    # The outer script names no Spotify terms, so it never launches Spotify and still
+    # works if Spotify isn't installed; the inner part runs only while it's running.
+    _AS_OUTER = ["on run argv", "try",
+                 'if application id "com.spotify.client" is not running then return "NOTRUNNING"',
+                 "on error", 'return "NOTINSTALLED"', "end try",
+                 "return run script (item 1 of argv)", "end run"]
+    _AS_STATUS = """
+set st to "stopped"
+set nm to ""
+set ar to ""
+set po to 0
+tell application id "com.spotify.client"
+    with timeout of 5 seconds
+        set ps to player state
+        if ps is playing then
+            set st to "playing"
+        else if ps is paused then
+            set st to "paused"
+        end if
+        try
+            set nm to name of current track
+            set ar to artist of current track
+        end try
+        try
+            set po to player position
+        end try
+    end timeout
+end tell
+set posMs to 0
+try
+    set posMs to (po * 1000) div 1
+end try
+set AppleScript's text item delimiters to character id 31
+set res to {"OK", st, nm as text, ar as text, posMs as text} as text
+set AppleScript's text item delimiters to ""
+return res
+"""
+    _AS_COMMANDS = {"next": "next track", "prev": "previous track", "toggle": "playpause"}
+    SPOTIFY_PERMISSION_ERROR = -1743
+
+    class _MacSpotify:
+        def __init__(self):
+            self.state = {"handle": None, "title": "", "playing": False, "song": None,
+                          "artist": None, "position": None, "error": None}
+            self.cmds = queue.Queue()
+            self.wanted_until = 0.0
+            self.thread = None
+
+        def want(self):
+            self.wanted_until = time.monotonic() + 5
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+        def _osascript(self, inner, timeout=130):
+            args = ["/usr/bin/osascript"]
+            for line in _AS_OUTER:
+                args += ["-e", line]
+            args.append(inner)
+            try:
+                p = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=timeout,
+                                   env=dict(os.environ, LANG="en_US.UTF-8"))
+            except (OSError, subprocess.TimeoutExpired):
+                return None, None
+            if p.returncode == 0:
+                return p.stdout.decode("utf-8", "replace").strip("\r\n"), None
+            m = re.search(r"\((-?\d+)\)\s*$", p.stderr.decode("utf-8", "replace").strip())
+            return None, int(m.group(1)) if m else -1
+
+        def _running(self):
+            try:
+                return subprocess.call(["/usr/bin/pgrep", "-x", "Spotify"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+            except OSError:
+                return True
+
+        def _poll(self):
+            if not self._running():
+                self.state = dict(self.state, handle=None, playing=False, error=None)
+                return
+            out, err = self._osascript(_AS_STATUS)
+            if err is not None:
+                self.state = dict(self.state, handle=True, error=err)
+                return
+            if not out or out in ("NOTRUNNING", "NOTINSTALLED"):
+                self.state = dict(self.state, handle=None, playing=False, error=None)
+                return
+            f = out.split("\x1f")
+            if len(f) != 5 or f[0] != "OK":
+                return
+            _ok, st, name, artist, pos = f
+            try:
+                position = int(pos) / 1000.0
+            except ValueError:
+                position = None
+            playing = st == "playing"
+            self.state = {"handle": True, "playing": playing, "song": name or None,
+                          "artist": artist, "position": position, "error": None,
+                          "title": "%s - %s" % (artist, name) if name else "Spotify"}
+
+        def _run(self):
+            while True:
+                try:
+                    action = self.cmds.get(timeout=1.0)
+                except queue.Empty:
+                    action = None
+                if action in _AS_COMMANDS:
+                    self._osascript('tell application id "com.spotify.client"\n'
+                                    "with timeout of 5 seconds\n%s\nend timeout\nend tell\n"
+                                    'return "OK"' % _AS_COMMANDS[action])
+                if action or time.monotonic() < self.wanted_until:
+                    self._poll()
+
+    _spotify = _MacSpotify()
+
+    def _mac_spotify_state():
+        _spotify.want()
+        return dict(_spotify.state)
+
+    def find_spotify_window():
+        st = _mac_spotify_state()
+        return st["handle"], st["title"]
+
+    def spotify_send(handle, action, use_keys=False):
+        _spotify.want()
+        _spotify.cmds.put(action)
+
+    def launch_spotify():
+        try:
+            subprocess.Popen(["/usr/bin/open", "-b", "com.spotify.client"])
+            return True
+        except OSError:
+            return False
+
+    def open_automation_settings():
+        try:
+            subprocess.Popen(["/usr/bin/open", "x-apple.systempreferences:"
+                              "com.apple.preference.security?Privacy_Automation"])
+        except OSError:
+            pass
+
+
+else:  # lets the logic be imported/tested elsewhere
     def exe_name_for_pid(pid): return ""
     def foreground_exe(): return ""
     def get_monitors(): return []
@@ -567,7 +1059,6 @@ else:  # lets the logic be imported/tested off-Windows
     def find_spotify_window(): return None, ""
     def make_overlay(win): pass
     def keep_on_top(win): win.attributes("-topmost", True)
-    def activate_pid(pid): return False
     def spotify_send(hwnd, action, use_keys=False): pass
     def launch_spotify(): return False
 
@@ -615,12 +1106,15 @@ def acquire_single_instance():
 
 def activate_existing_instance():
     if not IS_WINDOWS:
+        # Ask the running copy (through its local server) to bring itself to the front.
+        import urllib.request
         try:
-            with open(LOCK_FILE, "r") as f:
-                pid = int(f.read().strip() or 0)
-        except (OSError, ValueError):
+            req = urllib.request.Request("http://127.0.0.1:%d/show" % TAB_PORT, data=b"{}",
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=2).close()
+            return True
+        except Exception:
             return False
-        return bool(pid) and activate_pid(pid)
     hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE) or user32.FindWindowW(None, APP_TITLE)
     if not hwnd:
         return False
@@ -634,6 +1128,7 @@ def activate_existing_instance():
 #  Spotify (desktop app): song from its window title, controls via messages
 # ============================================================================
 SPOTIFY_GREEN = "#1db954"
+SPOTIFY_DENIED = -1743           # macOS: the user hasn't allowed us to control Spotify
 SPOTIFY_VERIFY = not IS_MAC      # title backend: retry with media keys if Spotify ignored a message
 SPOTIFY_IDLE_TITLES = {"spotify", "spotify premium", "spotify free"}
 
@@ -658,8 +1153,7 @@ def _title_spotify_state():
             "artist": artist, "position": None}
 
 
-if not IS_MAC:
-    spotify_state = _title_spotify_state
+spotify_state = _mac_spotify_state if IS_MAC else _title_spotify_state
 
 
 class SpotifyWatcher:
@@ -670,6 +1164,7 @@ class SpotifyWatcher:
         self.song = ""
         self.artist = ""
         self.played = 999.0          # seconds of the current song seen playing (999 = unknown)
+        self.error = None            # Mac: AppleScript error code (SPOTIFY_DENIED = no permission)
         self.use_keys = False        # Spotify ignored our window message: use media keys
         self._last = 0.0
         self._check = None           # (due, title before, action) to confirm a command worked
@@ -684,6 +1179,7 @@ class SpotifyWatcher:
         hwnd, title = st["handle"], st["title"]
         self.hwnd, self.title = hwnd, title
         playing, song, artist = st["playing"], st["song"], st["artist"]
+        self.error = st.get("error")
         if song is not None and (song, artist) != (self.song, self.artist):
             # Only trust "it just started" if we were watching when it changed.
             self.played = 0.0 if now - self._last < 2.5 else 999.0
@@ -875,7 +1371,7 @@ def open_in_chrome(url):
     """Open a URL in the user's normal Chrome (starting Chrome if needed). True if launched."""
     if IS_MAC:
         try:
-            subprocess.Popen(["/usr/bin/open", "-a", "Google Chrome", url])
+            subprocess.Popen(["/usr/bin/open", "-b", "com.google.Chrome", url])
             return True
         except OSError:
             return False
@@ -940,6 +1436,7 @@ class TabServer:
         self.ext_at = 0.0           # last /status from the extension
         self.poll_at = 0.0          # last /state poll (older extensions only poll)
         self.ext_version = ""       # extension version written to disk, if any
+        self.show_requested = False
         self.port = TAB_PORT
         self._httpd = None
 
@@ -1034,6 +1531,9 @@ class TabServer:
             def do_POST(self):
                 if not self._origin_ok():
                     return self._send(403, {})
+                if self.path.split("?")[0] == "/show":     # a second copy was launched
+                    srv.show_requested = True
+                    return self._send(200, {"ok": True})
                 if self.path.split("?")[0] != "/status":
                     return self._send(404, {})
                 try:
@@ -1454,10 +1954,18 @@ loop();
 """
 
 
+def ext_manifest():
+    if not IS_MAC:
+        return EXT_MANIFEST
+    # Chrome on a Mac unloads the profile (and this extension) when its last window closes;
+    # the "background" permission keeps it loaded so the study tab can be reopened.
+    return EXT_MANIFEST.replace('"storage", "alarms"]', '"storage", "alarms", "background"]')
+
+
 def write_extension():
     """Write the extension files if they changed. Returns the folder."""
     os.makedirs(EXT_DIR, exist_ok=True)
-    for name, text in (("manifest.json", EXT_MANIFEST), ("background.js", EXT_JS)):
+    for name, text in (("manifest.json", ext_manifest()), ("background.js", EXT_JS)):
         path = os.path.join(EXT_DIR, name)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1858,6 +2366,11 @@ class CheckList(tk.Frame):
         self.bind_all("<MouseWheel>", self._wheel, add="+")
         self.bind_all("<Button-4>", self._wheel, add="+")
         self.bind_all("<Button-5>", self._wheel, add="+")
+        self._swipe = 0
+        try:     # Tk 9 on a Mac sends trackpad scrolling as its own event
+            self.bind_all("<TouchpadScroll>", self._touchpad, add="+")
+        except tk.TclError:
+            pass
 
     def _layout(self):
         w, h = self.box.winfo_width(), self.box.winfo_height()
@@ -1884,14 +2397,28 @@ class CheckList(tk.Frame):
             self.box.create_line(x, y1, x, y2, fill=PANEL_HI, width=px(4),
                                  capstyle="round", tags="thumb")
 
-    def _wheel(self, e):
+    def _inside(self, e):
         try:
             if not self.winfo_exists():
-                return
+                return False
             w = self.winfo_containing(e.x_root, e.y_root)
         except (tk.TclError, KeyError):
+            return False
+        return w is not None and str(w).startswith(str(self))
+
+    def _touchpad(self, e):
+        if not self._inside(e):
             return
-        if w is None or not str(w).startswith(str(self)):
+        dy = e.delta & 0xFFFF                   # %D = dx << 16 | dy, both signed 16-bit pixels
+        self._swipe += dy - 0x10000 if dy >= 0x8000 else dy
+        while abs(self._swipe) >= px(16):
+            step = -1 if self._swipe > 0 else 1
+            self._swipe += step * px(16)
+            self.view.yview_scroll(step, "units")
+        self._scrolled()
+
+    def _wheel(self, e):
+        if not self._inside(e):
             return
         if getattr(e, "num", None) == 4:
             step = -1
@@ -2082,6 +2609,9 @@ class SpotifyCard(tk.Canvas):
         name = self._hit(e.x, e.y)
         if name == "open":
             launch_spotify()
+        elif name == "settings":
+            if IS_MAC:
+                open_automation_settings()
         elif name:
             self.watcher.command(name)
         else:
@@ -2106,7 +2636,7 @@ class SpotifyCard(tk.Canvas):
 
     def refresh(self):
         wt = self.watcher
-        sig = (wt.running, wt.playing, wt.song, wt.artist, self.hover)
+        sig = (wt.running, wt.playing, wt.song, wt.artist, wt.error, self.hover)
         if sig != self._sig:
             self._sig = sig
             self._draw()
@@ -2129,6 +2659,8 @@ class SpotifyCard(tk.Canvas):
         self.create_text(lx + r + px(6), ly, anchor="w", text="SPOTIFY", font=self.f_tag, fill=SUBTLE)
         if not wt.running:
             state, color = "Not open", SUBTLE
+        elif wt.error == SPOTIFY_DENIED:
+            state, color = "No access", WARN
         elif wt.playing:
             state, color = "Playing", SPOTIFY_GREEN
         else:
@@ -2138,6 +2670,8 @@ class SpotifyCard(tk.Canvas):
         # song + artist
         if not wt.running:
             song, sub = "Spotify isn't open", "Open it to control music here"
+        elif wt.error == SPOTIFY_DENIED:
+            song, sub = "Allow access to Spotify", "Privacy & Security > Automation"
         elif wt.song:
             song, sub = wt.song, wt.artist
         else:
@@ -2152,13 +2686,14 @@ class SpotifyCard(tk.Canvas):
 
         # controls
         cy = h - p - px(14)
-        if not wt.running:
+        if not wt.running or wt.error == SPOTIFY_DENIED:
+            text, name = ("Open Spotify", "open") if not wt.running else ("Open Settings", "settings")
             bw, bh = px(112), px(26)
             x1, y1 = (w - bw) / 2.0, cy - bh / 2.0
-            fill = PANEL_HI if self.hover == "open" else PANEL
+            fill = PANEL_HI if self.hover == name else PANEL
             round_rect(self, x1, y1, x1 + bw, y1 + bh, bh / 2.0, fill=fill, outline=fill)
-            self.create_text(w / 2.0, cy, text="Open Spotify", font=self.f_tag, fill=FG)
-            self.hits["open"] = (x1, y1, x1 + bw, y1 + bh)
+            self.create_text(w / 2.0, cy, text=text, font=self.f_tag, fill=FG)
+            self.hits[name] = (x1, y1, x1 + bw, y1 + bh)
             return
         gap = px(40)
         for name, cx in (("prev", w / 2.0 - gap), ("toggle", w / 2.0), ("next", w / 2.0 + gap)):
@@ -2200,7 +2735,8 @@ def rest_color(elapsed):
 class RestOverlay(tk.Toplevel):
     """Small always-on-top stopwatch pill that floats over games. Drag it anywhere."""
 
-    KEY = "#010203"          # painted where the window is see-through (rounded corners)
+    # painted where the window is see-through (rounded corners)
+    KEY = "systemTransparent" if IS_MAC else "#010203"
 
     def __init__(self, master, on_toggle, on_stop, on_moved):
         super().__init__(master)
@@ -2208,7 +2744,8 @@ class RestOverlay(tk.Toplevel):
         self.overrideredirect(True)
         self.title(APP_TITLE + " - rest")
         self.configure(bg=self.KEY)
-        for name, value in (("-topmost", True), ("-alpha", 0.95), ("-transparentcolor", self.KEY)):
+        see_through = ("-transparent", True) if IS_MAC else ("-transparentcolor", self.KEY)
+        for name, value in (("-topmost", True), ("-alpha", 0.95), see_through):
             try:
                 self.attributes(name, value)
             except tk.TclError:
@@ -2400,10 +2937,26 @@ class FocusLock(tk.Tk):
         self.rest_paused_at = None
         self.rest_seg = None            # monotonic start of rest time not yet saved
 
-        self.container = tk.Frame(self, bg=BG)
+        self.lock_win = None            # Mac: separate borderless window for Full lock
+        self._lock_armed = False
+        self._lock_baseline = set()
+        if IS_MAC:
+            global FONT
+            try:
+                FONT = tkfont.nametofont("TkDefaultFont").actual("family")   # San Francisco
+            except tk.TclError:
+                FONT = "Helvetica Neue"
+            # Cmd+Q, Dock > Quit and logout go here instead of killing the lock outright
+            self.createcommand("::tk::mac::Quit", self.on_close)
+
+        self.container = self.root_container = tk.Frame(self, bg=BG)
         self.container.pack(expand=True, fill="both")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.show_setup()
+        self.housekeeping()
+        if IS_MAC and self.settings.get("spotify"):
+            # ask for Spotify permission now, not in the middle of a full lock
+            self.after(1500, spotify_state)
 
     # ---- housekeeping ------------------------------------------------------
     def new_phase(self, phase):
@@ -2438,6 +2991,9 @@ class FocusLock(tk.Tk):
             self.credit_rest(stop=True)
             self.blocker.stop()
             self.tabsrv.end()
+            if IS_MAC and self._lock_armed:
+                self._lock_armed = False
+                set_presentation(0)
         except Exception:
             pass
 
@@ -2465,6 +3021,8 @@ class FocusLock(tk.Tk):
     def release_window(self):
         """Undo everything a lock screen did to the window."""
         self.quit_entry = None
+        if IS_MAC:
+            self._mac_release()
         for cv in self.covers:
             try:
                 cv.destroy()
@@ -2474,12 +3032,39 @@ class FocusLock(tk.Tk):
         self.cover_labels = []
         self.unbind("<Alt-F4>")
         self.unbind("<Escape>")
-        self.wm_attr(self, "-fullscreen", False)
+        if not IS_MAC:                     # (on a Mac the lock uses its own window)
+            self.wm_attr(self, "-fullscreen", False)
+            self.wm_attr(self, "-toolwindow", False)
         self.wm_attr(self, "-topmost", False)
-        self.wm_attr(self, "-toolwindow", False)
         self.container.configure(padx=0, pady=0)
         self.resizable(False, False)
         self.geometry("")
+
+    def _mac_release(self):
+        if self._lock_armed:
+            self._lock_armed = False
+            try:
+                set_presentation(0)                # Dock, menu bar and Cmd+Tab come back
+            except Exception:
+                pass
+        if self.lock_win is not None:
+            try:
+                self.lock_win.destroy()
+            except tk.TclError:
+                pass
+            self.lock_win = None
+            self.container = self.root_container
+            self.deiconify()
+
+    def housekeeping(self):
+        """A second copy of the app was started: show this one instead."""
+        if self.tabsrv.show_requested:
+            self.tabsrv.show_requested = False
+            if self.phase in ("setup", "done"):
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+        self.after(500, self.housekeeping)
 
     def credit_focus(self, stop=False):
         """Add focus time since the last save to today's total."""
@@ -2946,13 +3531,16 @@ class FocusLock(tk.Tk):
 
     def enter_full_lock(self):
         px_, py_, pw, ph = self.primary_monitor()
-        self.resizable(True, True)
-        self.geometry("+%d+%d" % (px_, py_))
-        self.update_idletasks()
-        self.wm_attr(self, "-fullscreen", True)
-        self.wm_attr(self, "-topmost", True)
-        self.bind("<Alt-F4>", lambda e: "break")
-        self.bind("<Escape>", lambda e: "break")
+        if IS_MAC:
+            self._mac_lock_window(px_, py_, pw, ph)
+        else:
+            self.resizable(True, True)
+            self.geometry("+%d+%d" % (px_, py_))
+            self.update_idletasks()
+            self.wm_attr(self, "-fullscreen", True)
+            self.wm_attr(self, "-topmost", True)
+            self.bind("<Alt-F4>", lambda e: "break")
+            self.bind("<Escape>", lambda e: "break")
 
         c = self.container
         center = tk.Frame(c, bg=BG)
@@ -2997,7 +3585,42 @@ class FocusLock(tk.Tk):
             self.cover_labels.append(t)
             top.bind("<Alt-F4>", lambda e: "break")
             self.covers.append(top)
-        self.focus_force()
+        if IS_MAC:
+            self.after(150, self._mac_arm_lock, self.gen)
+        else:
+            self.focus_force()
+
+    def _mac_lock_window(self, x, y, w, h):
+        """Mac Full lock: a borderless window that can still take typing (for the quit
+        phrase). Tk's own -fullscreen would move it to a separate Space instead."""
+        win = tk.Toplevel(self)
+        try:     # must happen before the window is first shown; "plain" = no title bar
+            win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "plain", "none")
+        except tk.TclError:
+            pass
+        win.title(APP_TITLE + " lock")
+        win.configure(bg=BG)
+        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.lock_win = win
+        self.container = tk.Frame(win, bg=BG)
+        self.container.pack(expand=True, fill="both")
+        self.withdraw()
+
+    def _mac_arm_lock(self, gen):
+        """Once the lock windows are on screen: kiosk mode + raise them above everything."""
+        if gen != self.gen or self.lock_win is None:
+            return
+        self._lock_baseline = window_owner_numbers()       # loginwindow windows already up
+        for w in [self.lock_win] + self.covers:
+            set_window_level(w, LEVEL_LOCK, CB_EVERYWHERE, can_hide=False)
+        activate_self()
+        try:
+            set_presentation(LOCK_OPTIONS)
+            self._lock_armed = True
+        except Exception:
+            pass
+        self.lock_win.focus_force()
 
     def _bar(self, ring_color):
         """Compact top-of-screen window used for Study mode and breaks."""
@@ -3178,6 +3801,10 @@ class FocusLock(tk.Tk):
         """Full lock: stay on top of everything, except Task Manager."""
         if gen != self.gen:
             return
+        if IS_MAC:
+            self._mac_keep_lock()
+            self.after(250, self.keep_focus, gen)
+            return
         windows = [self] + self.covers
         if foreground_exe() in ESCAPE_APPS:
             for w in windows:                      # step aside so you can end us
@@ -3192,25 +3819,53 @@ class FocusLock(tk.Tk):
                     self.quit_entry.focus_force()
         self.after(250, self.keep_focus, gen)
 
+    def _mac_keep_lock(self):
+        if self.lock_win is None or not self._lock_armed:
+            return
+        windows = [self.lock_win] + self.covers
+        pid, bundle, name = frontmost_app()
+        force_quit = bool(window_owner_numbers() - self._lock_baseline)
+        if force_quit or name in ESCAPE_APPS or bundle == "com.apple.securityagent":
+            for w in windows:                      # step aside so you can end us
+                set_window_level(w, LEVEL_NORMAL)
+            return
+        for w in windows:
+            set_window_level(w, LEVEL_LOCK)
+        if pid != os.getpid():                     # something else got activated: take it back
+            activate_self()
+            target = self.quit_entry if self.quit_entry is not None else self.lock_win
+            try:
+                target.focus_force()
+            except tk.TclError:
+                pass
+
     def guard_tick(self, gen):
         """Study mode: minimise anything that isn't allowed."""
         if gen != self.gen:
             return
         chrome_visible = False
-        for hwnd, _pid, exe, _title in list_app_windows(exclude_pids={os.getpid()}):
-            if exe == CHROME_KEY:
-                chrome_visible = True
-            if not exe or exe in self.allowed or exe in ALWAYS_ALLOWED:
-                continue
-            minimize_window(hwnd)
+        if IS_MAC:
+            hide_disallowed(self.allowed)      # Chrome running != tab alive on a Mac (see below)
+        else:
+            for hwnd, _pid, exe, _title in list_app_windows(exclude_pids={os.getpid()}):
+                if exe == CHROME_KEY:
+                    chrome_visible = True
+                if not exe or exe in self.allowed or exe in ALWAYS_ALLOWED:
+                    continue
+                minimize_window(hwnd)
         self.revive_chrome(chrome_visible)
+        if self.state() == "iconic":           # the bar was minimised (e.g. Cmd+M)
+            self.deiconify()
         self.wm_attr(self, "-topmost", True)
-        self.lift()
+        if not IS_MAC:                         # (topmost is enough there; don't risk focus)
+            self.lift()
         self.after(300, self.guard_tick, gen)
 
     def revive_chrome(self, chrome_visible):
-        """If Chrome was closed entirely (so the extension can't react), reopen the page."""
-        if not (self.tab_locked and self.tabsrv.locked_url) or chrome_visible:
+        """If Chrome was closed entirely (so the extension can't react), reopen the page.
+        On a Mac, Chrome keeps running after its last window closes but unloads the
+        extension, so a silent extension is enough reason to reopen the page."""
+        if not (self.tab_locked and self.tabsrv.locked_url) or (chrome_visible and not IS_MAC):
             return
         now = time.monotonic()
         if time.time() - self.tabsrv.status_at < 8 or now - self._last_relaunch < 10:
@@ -3367,9 +4022,142 @@ class FocusLock(tk.Tk):
         self.after(1000, self.rest_keep_on_top, gen)
 
 
+def run_checks():
+    """`python3 focus_lock.py --check`: try each platform feature on its own and print
+    PASS / FAIL, without starting a session. Takes about 15 seconds."""
+    def report(ok, name, detail=""):
+        tag = "INFO" if ok is None else ("PASS" if ok else "FAIL")
+        print("%-4s  %s%s" % (tag, name, (": " + str(detail)) if detail != "" else ""), flush=True)
+
+    def wait(root, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            root.update()
+            time.sleep(0.02)
+
+    def step(name, fn):
+        try:
+            fn()
+        except Exception as e:                      # keep going, report what broke
+            report(False, name, "%s: %s" % (type(e).__name__, e))
+
+    print("Focus Lock check  -  %s, Python %s" % (sys.platform, sys.version.split()[0]))
+    root = tk.Tk()
+    report(None, "Tk", root.tk.call("info", "patchlevel"))
+    if IS_MAC and tk.TkVersion < 8.6:
+        report(False, "Tk version", "Tk 8.6+ needed - install Python from python.org")
+        return
+    root.title("Focus Lock check")
+    root.configure(bg=BG)
+    tk.Label(root, text="Checking...  (the Dock and menu bar disappear for 2 seconds)",
+             bg=BG, fg=FG, padx=30, pady=30).pack()
+    wait(root, 0.5)
+
+    def fonts():
+        fam = tkfont.nametofont("TkDefaultFont").actual("family") if IS_MAC else FONT
+        f = tkfont.Font(root=root, family=fam, size=fs(10))
+        report(f.metrics("linespace") >= 12, "Fonts", "%s, size 10 -> %d px line"
+               % (fam, f.metrics("linespace")))
+    step("Fonts", fonts)
+
+    def displays():
+        mons = get_monitors()
+        report(bool(mons), "Displays", mons)
+    step("Displays", displays)
+
+    def apps():
+        names = sorted({exe for _h, _p, exe, _t in list_app_windows(
+            exclude_pids={os.getpid()}, include_minimized=True)})
+        report(bool(names), "Running apps (Study mode can hide these)", ", ".join(names[:12]))
+    step("Running apps", apps)
+
+    if IS_MAC:
+        def front():
+            pid, bundle, name = frontmost_app()
+            report(pid is not None, "Frontmost app", "%s (%s)" % (name, bundle))
+        step("Frontmost app", front)
+
+        def lock_window():
+            win = tk.Toplevel(root)
+            win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "plain", "none")
+            win.configure(bg=BG)
+            win.geometry("420x140+120+120")
+            var = tk.StringVar()
+            e = tk.Entry(win, textvariable=var)
+            e.pack(padx=30, pady=50)
+            wait(root, 0.4)
+            ok_level = set_window_level(win, LEVEL_LOCK, CB_EVERYWHERE, can_hide=False)
+            activate_self()
+            e.focus_force()
+            wait(root, 0.4)
+            report(ok_level, "Lock window found and raised above the menu bar")
+            report(win.focus_get() is e, "Lock window accepts typing (quit phrase)")
+            win.destroy()
+        step("Lock window", lock_window)
+
+        def kiosk():
+            activate_self()
+            wait(root, 0.3)
+            set_presentation(LOCK_OPTIONS)
+            wait(root, 2.0)
+            got = current_presentation()
+            set_presentation(0)
+            wait(root, 0.3)
+            report(got == LOCK_OPTIONS, "Kiosk mode (Dock, menu bar and Cmd+Tab off)",
+                   "options %d, expected %d" % (got, LOCK_OPTIONS))
+            report(current_presentation() == 0, "Kiosk mode switched back off")
+        step("Kiosk mode", kiosk)
+
+        def overlay():
+            pill = RestOverlay(root, lambda: None, lambda: None, lambda x, y: None)
+            pill.geometry("+200+300")
+            pill.show(754, False, "Rest stopwatch test", MUTED)
+            wait(root, 0.4)
+            make_overlay(pill)
+            wait(root, 1.0)
+            report(nswindow(pill) is not None, "Rest stopwatch floats on top")
+            pill.destroy()
+        step("Rest stopwatch", overlay)
+
+        def spotify():
+            if not _spotify._running():
+                report(None, "Spotify", "not running - open it and run the check again")
+                return
+            _spotify._poll()
+            st = _spotify.state
+            if st.get("error") == SPOTIFY_DENIED:
+                report(False, "Spotify control", "not allowed - System Settings > Privacy & "
+                       "Security > Automation > (your terminal) > Spotify")
+            elif st.get("error") is not None:
+                report(False, "Spotify control", "AppleScript error %s" % st["error"])
+            else:
+                report(True, "Spotify control", "%s - %s (%s)" % (
+                    st.get("artist"), st.get("song"), "playing" if st.get("playing") else "paused"))
+        step("Spotify", spotify)
+
+        def chrome():
+            running = subprocess.call(["/usr/bin/pgrep", "-x", "Google Chrome"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+            installed = os.path.isfile(os.path.join(EXT_DIR, "manifest.json"))
+            report(None, "Chrome", "%s; extension files %s" % (
+                "running" if running else "not running",
+                "written" if installed else "not written yet (use 'Install extension')"))
+        step("Chrome", chrome)
+
+    root.destroy()
+    print("Done. Copy everything above and send it over if anything says FAIL.")
+
+
 def main():
     if not (IS_WINDOWS or IS_MAC) and not os.environ.get("FOCUSLOCK_DEV"):
         print("Focus Lock runs on Windows and macOS.")
+        sys.exit(1)
+    if "--check" in sys.argv:
+        run_checks()
+        return
+    if IS_MAC and tk.TkVersion < 8.6:
+        print("Focus Lock needs Tk 8.6 or newer. Apple's built-in python3 has an old Tk;\n"
+              "install Python from https://www.python.org/downloads/macos/ and run it with that.")
         sys.exit(1)
     if not acquire_single_instance():
         if not activate_existing_instance():

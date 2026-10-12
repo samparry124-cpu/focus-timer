@@ -69,6 +69,7 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 APP_TITLE = "Focus Lock"
 
 # ---- Look & feel -----------------------------------------------------------
@@ -87,7 +88,8 @@ WARN = "#fbbf24"
 WARN_HI = "#fcd34d"
 DANGER = "#f87171"
 INK = "#0b1120"          # text on bright fills
-FONT = "Segoe UI"
+FONT = "Segoe UI"        # on a Mac, replaced by the system font when the app starts
+FONT_SCALE = 1.0         # Tk on a Mac renders points at 72 dpi; scaled up there to match
 
 QUIT_PHRASE = "i am choosing to be distracted"
 PRESETS = [15, 25, 45, 60]
@@ -105,10 +107,22 @@ def px(n):
     return int(round(n * _SCALE))
 
 
+def fs(size):
+    """Font size in points (negative = pixels, left alone)."""
+    return size if size < 0 else int(round(size * FONT_SCALE))
+
+
+def font(size, weight="normal"):
+    return (FONT, fs(size), weight)
+
+
 # ---- Paths / settings ------------------------------------------------------
 TAB_PORT = 9334
-_APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
-_LOCAL = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+if IS_MAC and "APPDATA" not in os.environ:
+    _APPDATA = _LOCAL = os.path.expanduser("~/Library/Application Support")
+else:
+    _APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
+    _LOCAL = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 SETTINGS_FILE = os.path.join(_APPDATA, "FocusLock", "settings.json")
 STATS_FILE = os.path.join(_APPDATA, "FocusLock", "stats.json")
 EXT_DIR = os.path.join(_LOCAL, "FocusLock", "extension")
@@ -124,7 +138,7 @@ def parse_exes(text):
     for tok in text.replace(";", ",").replace("\n", ",").split(","):
         tok = tok.strip().lower()
         if tok:
-            out.add(tok if "." in tok else tok + ".exe")
+            out.add(tok if "." in tok or not IS_WINDOWS else tok + ".exe")
     return out
 
 
@@ -277,6 +291,15 @@ ALWAYS_ALLOWED = {
     "ctfmon.exe", "consent.exe", "logonui.exe", "winlogon.exe", "csrss.exe",
     "fontdrvhost.exe", "securityhealthsystray.exe",
 }
+if IS_MAC:
+    # On a Mac apps are identified by their lower-case name ("google chrome").
+    ALWAYS_ALLOWED = {"activity monitor"}          # the Mac escape hatch - never hide it
+    CHROME_KEY = "google chrome"
+    ESCAPE_APPS = {"activity monitor", "loginwindow", "dock"}   # Force Quit lives here
+else:
+    CHROME_KEY = "chrome.exe"
+    ESCAPE_APPS = {"taskmgr.exe"}
+
 SKIP_CLASSES = {
     "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
     "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
@@ -466,15 +489,25 @@ if IS_WINDOWS:
     def minimize_window(hwnd):
         user32.ShowWindowAsync(hwnd, SW_MINIMIZE)
 
-    def make_overlay(hwnd):
-        """Clicking the window won't take focus from a game; no taskbar button."""
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+    def _hwnd(win):
+        try:
+            return int(win.wm_frame(), 16)
+        except (tk.TclError, ValueError):
+            return None
 
-    def keep_on_top(hwnd):
+    def make_overlay(win):
+        """Clicking the window won't take focus from a game; no taskbar button."""
+        hwnd = _hwnd(win)
+        if hwnd:
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+
+    def keep_on_top(win):
         """Re-assert always-on-top without activating (games can push themselves above)."""
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        hwnd = _hwnd(win)
+        if hwnd:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     def find_spotify_window():
         """(hwnd, title) of the Spotify desktop app's main window, or (None, '').
@@ -532,20 +565,42 @@ else:  # lets the logic be imported/tested off-Windows
     def list_app_windows(exclude_pids=(), include_minimized=False): return []
     def minimize_window(hwnd): pass
     def find_spotify_window(): return None, ""
-    def make_overlay(hwnd): pass
-    def keep_on_top(hwnd): pass
+    def make_overlay(win): pass
+    def keep_on_top(win): win.attributes("-topmost", True)
+    def activate_pid(pid): return False
     def spotify_send(hwnd, action, use_keys=False): pass
     def launch_spotify(): return False
 
 
 # ---- Only one copy at a time -----------------------------------------------
 _instance_mutex = None
+_instance_lock = None
+LOCK_FILE = os.path.join(_APPDATA, "FocusLock", "instance.lock")
 
 
 def acquire_single_instance():
-    """True if we are the only Focus Lock running (keeps a named mutex open)."""
-    global _instance_mutex
+    """True if we are the only Focus Lock running (keeps a named mutex / file lock open)."""
+    global _instance_mutex, _instance_lock
     if not IS_WINDOWS:
+        try:
+            import fcntl
+            os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+            f = open(LOCK_FILE, "a+")
+        except (ImportError, OSError):
+            return True                 # can't tell - don't lock the user out
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # released by the OS if we crash
+        except BlockingIOError:
+            f.close()
+            return False
+        except OSError:
+            f.close()
+            return True
+        f.seek(0)
+        f.truncate()
+        f.write(str(os.getpid()))
+        f.flush()
+        _instance_lock = f
         return True
     h = kernel32.CreateMutexW(None, False, "Local\\FocusLock.SingleInstance")
     err = ctypes.get_last_error()
@@ -559,6 +614,13 @@ def acquire_single_instance():
 
 
 def activate_existing_instance():
+    if not IS_WINDOWS:
+        try:
+            with open(LOCK_FILE, "r") as f:
+                pid = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            return False
+        return bool(pid) and activate_pid(pid)
     hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE) or user32.FindWindowW(None, APP_TITLE)
     if not hwnd:
         return False
@@ -572,6 +634,7 @@ def activate_existing_instance():
 #  Spotify (desktop app): song from its window title, controls via messages
 # ============================================================================
 SPOTIFY_GREEN = "#1db954"
+SPOTIFY_VERIFY = not IS_MAC      # title backend: retry with media keys if Spotify ignored a message
 SPOTIFY_IDLE_TITLES = {"spotify", "spotify premium", "spotify free"}
 
 
@@ -585,6 +648,18 @@ def parse_spotify_title(title):
         artist, song = t.split(" - ", 1)
         return True, song.strip(), artist.strip()
     return True, t, ""                       # e.g. "Advertisement"
+
+
+def _title_spotify_state():
+    """Windows: everything comes from the Spotify window's title."""
+    hwnd, title = find_spotify_window()
+    playing, song, artist = parse_spotify_title(title) if hwnd else (False, None, None)
+    return {"handle": hwnd, "title": title, "playing": playing, "song": song,
+            "artist": artist, "position": None}
+
+
+if not IS_MAC:
+    spotify_state = _title_spotify_state
 
 
 class SpotifyWatcher:
@@ -605,18 +680,21 @@ class SpotifyWatcher:
 
     def poll(self):
         now = time.monotonic()
-        hwnd, title = find_spotify_window()
+        st = spotify_state()
+        hwnd, title = st["handle"], st["title"]
         self.hwnd, self.title = hwnd, title
-        playing, song, artist = parse_spotify_title(title) if hwnd else (False, None, None)
+        playing, song, artist = st["playing"], st["song"], st["artist"]
         if song is not None and (song, artist) != (self.song, self.artist):
             # Only trust "it just started" if we were watching when it changed.
             self.played = 0.0 if now - self._last < 2.5 else 999.0
             self.song, self.artist = song, artist
         elif self.playing and playing:
             self.played += now - self._last
+        if st["position"] is not None:
+            self.played = st["position"]        # the Mac app reports the real position
         self.playing = playing
         self._last = now
-        if self._check and now >= self._check[0]:
+        if SPOTIFY_VERIFY and self._check and now >= self._check[0]:
             _due, before, action = self._check
             self._check = None
             if hwnd and title == before and not self.use_keys:
@@ -767,6 +845,13 @@ def _chime_file(kind):
 
 def play_chime(kind):
     def run():
+        if IS_MAC:
+            try:
+                subprocess.run(["/usr/bin/afplay", _chime_file(kind)], timeout=10,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            return
         try:
             import winsound
         except ImportError:
@@ -786,6 +871,34 @@ def play_chime(kind):
 # ============================================================================
 #  Local API that the Chrome extension polls
 # ============================================================================
+def open_in_chrome(url):
+    """Open a URL in the user's normal Chrome (starting Chrome if needed). True if launched."""
+    if IS_MAC:
+        try:
+            subprocess.Popen(["/usr/bin/open", "-a", "Google Chrome", url])
+            return True
+        except OSError:
+            return False
+    path = find_chrome()
+    if not path:
+        return False
+    try:
+        subprocess.Popen([path, url])
+        return True
+    except OSError:
+        return False
+
+
+def open_folder(path):
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)                     # Explorer
+        elif IS_MAC:
+            subprocess.Popen(["/usr/bin/open", path])   # Finder
+    except Exception:
+        pass
+
+
 def find_chrome():
     candidates = [
         os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
@@ -1406,7 +1519,7 @@ def watch_var(widget, var, callback):
 
 
 def bold(size):
-    return tkfont.Font(family=FONT, size=size, weight="bold")
+    return tkfont.Font(family=FONT, size=fs(size), weight="bold")
 
 
 class RoundButton(tk.Canvas):
@@ -1503,10 +1616,10 @@ class Toggle(tk.Frame):
         col = tk.Frame(self, bg=bg, cursor="hand2")
         col.pack(side="left", padx=(px(10), 0), fill="x")
         parts = [self, self.sw, col,
-                 tk.Label(col, text=text, bg=bg, fg=FG, font=(FONT, 10), cursor="hand2")]
+                 tk.Label(col, text=text, bg=bg, fg=FG, font=font(10), cursor="hand2")]
         parts[-1].pack(anchor="w")
         if sub:
-            parts.append(tk.Label(col, text=sub, bg=bg, fg=SUBTLE, font=(FONT, 9),
+            parts.append(tk.Label(col, text=sub, bg=bg, fg=SUBTLE, font=font(9),
                                   cursor="hand2", justify="left"))
             parts[-1].pack(anchor="w")
         for w in parts:
@@ -1667,7 +1780,7 @@ class RoundEntry(tk.Canvas):
     """Text entry inside a rounded box that lights up when focused."""
 
     def __init__(self, parent, variable, width, size=11, justify="left"):
-        font = tkfont.Font(family=FONT, size=size)
+        font = tkfont.Font(family=FONT, size=fs(size))
         self.h = font.metrics("linespace") + 2 * px(8)
         super().__init__(parent, width=width, height=self.h, bg=parent["bg"],
                          highlightthickness=0, bd=0, cursor="xterm")
@@ -1712,9 +1825,9 @@ class StatCard(tk.Canvas):
                          highlightthickness=0, bd=0)
         w, h, p = width, height, px(16)
         round_rect(self, 1, 1, w - 2, h - 2, px(16), fill=SURFACE, outline=BORDER)
-        self.create_text(p, p, anchor="nw", text=title, fill=SUBTLE, font=(FONT, 8, "bold"))
-        self.create_text(p, p + px(17), anchor="nw", text=value, fill=FG, font=(FONT, 19, "bold"))
-        self.create_text(p, h - p + px(2), anchor="sw", text=sub, fill=MUTED, font=(FONT, 9))
+        self.create_text(p, p, anchor="nw", text=title, fill=SUBTLE, font=font(8, "bold"))
+        self.create_text(p, p + px(17), anchor="nw", text=value, fill=FG, font=font(19, "bold"))
+        self.create_text(p, h - p + px(2), anchor="sw", text=sub, fill=MUTED, font=font(9))
         if dots:
             d, gap = px(8), px(4)
             x = w - p - len(dots) * d - (len(dots) - 1) * gap
@@ -1796,7 +1909,7 @@ class CheckList(tk.Frame):
         self.vars = {}
         if not items:
             tk.Label(self.rows, text="No other apps are open right now.", bg=SURFACE,
-                     fg=SUBTLE, font=(FONT, 9)).pack(anchor="w", padx=px(10), pady=px(10))
+                     fg=SUBTLE, font=font(9)).pack(anchor="w", padx=px(10), pady=px(10))
         for exe, title, checked in items:
             var = tk.BooleanVar(value=checked)
             self.vars[exe] = var
@@ -1813,9 +1926,9 @@ class CheckList(tk.Frame):
         s = px(18)
         chk = tk.Canvas(row, width=s, height=s, bg=SURFACE, highlightthickness=0, cursor="hand2")
         chk.pack(side="left", padx=(px(10), px(10)), pady=px(6))
-        name = tk.Label(row, text=exe, bg=SURFACE, fg=FG, font=(FONT, 10), cursor="hand2")
+        name = tk.Label(row, text=exe, bg=SURFACE, fg=FG, font=font(10), cursor="hand2")
         name.pack(side="left")
-        sub = tk.Label(row, text=title[:38], bg=SURFACE, fg=SUBTLE, font=(FONT, 9),
+        sub = tk.Label(row, text=title[:38], bg=SURFACE, fg=SUBTLE, font=font(9),
                        anchor="w", cursor="hand2")
         sub.pack(side="left", padx=(px(8), px(4)), fill="x", expand=True)
         parts = (row, chk, name, sub)
@@ -1881,11 +1994,11 @@ class Ring(tk.Canvas):
         self.time_px = time_px or int(size * 0.17)
         self.sub_px = sub_px or max(px(9), int(size * 0.04))
         self.top_id = self.create_text(c, c - self.time_px * 0.92, text="", fill=SUBTLE,
-                                       font=(FONT, -int(self.sub_px * 0.8), "bold"))
+                                       font=font(-int(self.sub_px * 0.8), "bold"))
         self.time_id = self.create_text(c, c, text="", fill=FG,
-                                        font=(FONT, -self.time_px, "bold"))
+                                        font=font(-self.time_px, "bold"))
         self.sub_id = self.create_text(c, c + self.time_px * 0.88, text="", fill=MUTED,
-                                       font=(FONT, -self.sub_px))
+                                       font=font(-self.sub_px))
         self._lit = -1
         self._long = None
 
@@ -1927,7 +2040,7 @@ class Ring(tk.Canvas):
             if long_text != self._long:
                 self._long = long_text
                 size = int(self.time_px * (0.74 if long_text else 1.0))
-                self.itemconfig(self.time_id, font=(FONT, -size, "bold"))
+                self.itemconfig(self.time_id, font=font(-size, "bold"))
             self.itemconfig(self.time_id, text=text)
         if sub is not None:
             self.itemconfig(self.sub_id, text=sub, fill=sub_color or MUTED)
@@ -1943,7 +2056,7 @@ class SpotifyCard(tk.Canvas):
                          highlightthickness=0, bd=0)
         self.watcher, self.w, self.h = watcher, width, height
         self.f_song = bold(10)
-        self.f_sub = tkfont.Font(family=FONT, size=9)
+        self.f_sub = tkfont.Font(family=FONT, size=fs(9))
         self.f_tag = bold(7)
         self.hover = None
         self.hits = {}               # name -> (x1, y1, x2, y2)
@@ -2106,7 +2219,7 @@ class RestOverlay(tk.Toplevel):
         self.cv.pack()
         self.f_time = bold(20)
         self.f_tag = bold(7)
-        self.f_sub = tkfont.Font(family=FONT, size=9)
+        self.f_sub = tkfont.Font(family=FONT, size=fs(9))
         self.hover = None
         self.hits = {}
         self.state = None
@@ -2117,12 +2230,6 @@ class RestOverlay(tk.Toplevel):
         self.cv.bind("<ButtonPress-1>", self._down)
         self.cv.bind("<B1-Motion>", self._dragging)
         self.cv.bind("<ButtonRelease-1>", self._up)
-
-    def hwnd(self):
-        try:
-            return int(self.wm_frame(), 16)
-        except (tk.TclError, ValueError):
-            return None
 
     # ---- mouse: buttons + drag to move -------------------------------------
     def _hit(self, x, y):
@@ -2232,14 +2339,14 @@ class RestOverlay(tk.Toplevel):
 
 
 def section(parent, text, pady=(16, 7)):
-    lab = tk.Label(parent, text=text.upper(), bg=parent["bg"], fg=SUBTLE, font=(FONT, 8, "bold"))
+    lab = tk.Label(parent, text=text.upper(), bg=parent["bg"], fg=SUBTLE, font=font(8, "bold"))
     lab.pack(anchor="w", pady=(px(pady[0]), px(pady[1])))
     return lab
 
 
 def label(parent, text, size=10, color=FG, weight="normal", **kw):
     return tk.Label(parent, text=text, bg=parent["bg"], fg=color,
-                    font=(FONT, size, weight), **kw)
+                    font=font(size, weight), **kw)
 
 
 # ============================================================================
@@ -2386,7 +2493,7 @@ class FocusLock(tk.Tk):
             self.stats.add(secs)
 
     def chime(self, kind):
-        if IS_WINDOWS:
+        if IS_WINDOWS or IS_MAC:
             play_chime(kind)
         else:
             self.bell()
@@ -2641,13 +2748,8 @@ class FocusLock(tk.Tk):
     def open_extension_page(self):
         ext_id = self.tabsrv.ext.get("id") or ""
         url = "chrome://extensions/?id=" + ext_id if ext_id else "chrome://extensions"
-        chrome = find_chrome()
-        if chrome:
-            try:
-                subprocess.Popen([chrome, url])
-                return
-            except OSError:
-                pass
+        if open_in_chrome(url):
+            return
         from tkinter import messagebox
         messagebox.showinfo(APP_TITLE, "Open %s in Chrome, click Details on Focus Lock and "
                                        "switch on 'Allow in Incognito'." % url)
@@ -2660,23 +2762,15 @@ class FocusLock(tk.Tk):
             messagebox.showerror(APP_TITLE, "Couldn't write the extension files:\n%s" % e)
             return
         self.tabsrv.ext_version = EXT_VERSION
-        try:
-            os.startfile(folder)                       # opens the folder in Explorer
-        except Exception:
-            pass
-        chrome = find_chrome()
-        if chrome:
-            try:
-                subprocess.Popen([chrome, "chrome://extensions"])
-            except OSError:
-                pass
+        open_folder(folder)
+        open_in_chrome("chrome://extensions")
         messagebox.showinfo(
             "Install the Focus Lock extension",
             "Do this once (about 30 seconds):\n\n"
             "1. In the Chrome page that just opened, switch ON 'Developer mode' "
             "(top-right).\n"
             "2. Click 'Load unpacked' and choose the folder that just opened in "
-            "Explorer:\n    " + folder + "\n"
+            "%s:\n    " % ("Finder" if IS_MAC else "Explorer") + folder + "\n"
             "   (Already installed? Just click the reload arrow on Focus Lock.)\n"
             "3. Click 'Details' on Focus Lock and switch ON 'Allow in Incognito'. "
             "This is required - otherwise a private window would get around the lock.\n"
@@ -2748,7 +2842,7 @@ class FocusLock(tk.Tk):
             return
         st = self.tabsrv.status
         if st.get("locked"):
-            params["allowed"].add("chrome.exe")
+            params["allowed"].add(CHROME_KEY)
             self.begin_session(params)
             return
         if st.get("error"):
@@ -2897,8 +2991,8 @@ class FocusLock(tk.Tk):
             box = tk.Frame(top, bg="black")
             box.place(relx=0.5, rely=0.5, anchor="center")
             tk.Label(box, text="F O C U S", bg="black", fg=PANEL,
-                     font=(FONT, 16, "bold")).pack()
-            t = tk.Label(box, text="", bg="black", fg="#334155", font=(FONT, 40, "bold"))
+                     font=font(16, "bold")).pack()
+            t = tk.Label(box, text="", bg="black", fg="#334155", font=font(40, "bold"))
             t.pack()
             self.cover_labels.append(t)
             top.bind("<Alt-F4>", lambda e: "break")
@@ -3085,7 +3179,7 @@ class FocusLock(tk.Tk):
         if gen != self.gen:
             return
         windows = [self] + self.covers
-        if foreground_exe() == "taskmgr.exe":
+        if foreground_exe() in ESCAPE_APPS:
             for w in windows:                      # step aside so you can end us
                 self.wm_attr(w, "-topmost", False)
         else:
@@ -3104,7 +3198,7 @@ class FocusLock(tk.Tk):
             return
         chrome_visible = False
         for hwnd, _pid, exe, _title in list_app_windows(exclude_pids={os.getpid()}):
-            if exe == "chrome.exe":
+            if exe == CHROME_KEY:
                 chrome_visible = True
             if not exe or exe in self.allowed or exe in ALWAYS_ALLOWED:
                 continue
@@ -3122,12 +3216,7 @@ class FocusLock(tk.Tk):
         if time.time() - self.tabsrv.status_at < 8 or now - self._last_relaunch < 10:
             return
         self._last_relaunch = now
-        path = find_chrome()
-        if path:
-            try:
-                subprocess.Popen([path, self.tabsrv.locked_url])
-            except OSError:
-                pass
+        open_in_chrome(self.tabsrv.locked_url)
 
     # ---- ending ------------------------------------------------------------
     def finish(self, completed):
@@ -3186,12 +3275,10 @@ class FocusLock(tk.Tk):
         x, y = self._rest_position(win)
         win.geometry("+%d+%d" % (x, y))
         win.update_idletasks()
-        hwnd = win.hwnd()
-        if hwnd:
-            try:
-                make_overlay(hwnd)
-            except Exception:
-                pass
+        try:
+            make_overlay(win)
+        except Exception:
+            pass
         self.rest_tick(gen)
         self.rest_keep_on_top(gen)
 
@@ -3273,26 +3360,25 @@ class FocusLock(tk.Tk):
     def rest_keep_on_top(self, gen):
         if gen != self.gen or self.rest_win is None:
             return
-        hwnd = self.rest_win.hwnd()
         try:
-            if hwnd and IS_WINDOWS:
-                keep_on_top(hwnd)
-            else:
-                self.rest_win.attributes("-topmost", True)
+            keep_on_top(self.rest_win)
         except Exception:
             pass
         self.after(1000, self.rest_keep_on_top, gen)
 
 
 def main():
-    if not IS_WINDOWS and not os.environ.get("FOCUSLOCK_DEV"):
-        print("Focus Lock only runs on Windows.")
+    if not (IS_WINDOWS or IS_MAC) and not os.environ.get("FOCUSLOCK_DEV"):
+        print("Focus Lock runs on Windows and macOS.")
         sys.exit(1)
-    if IS_WINDOWS:
-        if not acquire_single_instance():
-            if not activate_existing_instance():
+    if not acquire_single_instance():
+        if not activate_existing_instance():
+            if IS_WINDOWS:
                 user32.MessageBoxW(None, "Focus Lock is already running.", APP_TITLE, 0x40)
-            sys.exit(0)
+            else:
+                print("Focus Lock is already running.")
+        sys.exit(0)
+    if IS_WINDOWS:
         try:  # keep Tk and Win32 coordinates in the same pixel space
             ctypes.WinDLL("shcore").SetProcessDpiAwareness(1)
         except Exception:

@@ -16,6 +16,14 @@ BREAKS
   included). When the break runs out, the lock comes back on by itself and
   Chrome jumps back to your study tab.
 
+SPOTIFY
+  With "Spotify controls" on, a card next to the timer shows what the Spotify
+  desktop app is playing, with back / play-pause / skip buttons. It reads the
+  song from Spotify's window and sends it commands directly, so there is no
+  login. It needs the desktop app (not the web player) and doesn't see songs
+  playing on another device. "Back" goes to the previous song, not just the
+  start of the current one.
+
 CHROME TAB LOCK (Study mode)
   1. Open the page you want to study in your normal Chrome.
   2. Press Start. Focus Lock locks THAT tab:
@@ -97,7 +105,7 @@ EXT_DIR = os.path.join(_LOCAL, "FocusLock", "extension")
 SOUND_DIR = os.path.join(_LOCAL, "FocusLock", "sounds")
 
 DEFAULTS = {"minutes": "25", "mode": "full", "locktab": True, "exact": True,
-            "apps": [], "extra": "", "breaks": 1, "break_minutes": 5}
+            "apps": [], "extra": "", "breaks": 1, "break_minutes": 5, "spotify": True}
 
 
 def parse_exes(text):
@@ -137,6 +145,7 @@ def load_settings():
     s["apps"] = [str(a).lower() for a in s["apps"] if a]
     s["breaks"] = _nearest(s.get("breaks"), BREAK_COUNTS)
     s["break_minutes"] = _nearest(s.get("break_minutes"), BREAK_MINUTES)
+    s["spotify"] = bool(s.get("spotify", True))
     return s
 
 
@@ -257,6 +266,10 @@ WS_EX_TOOLWINDOW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE = 0x80, 0x40000, 0x08000000
 SW_SHOW, SW_MINIMIZE, SW_RESTORE = 5, 6, 9
 DWMWA_CLOAKED = 14
 ERROR_ALREADY_EXISTS = 183
+WM_APPCOMMAND = 0x319
+KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
+# action -> (APPCOMMAND_* sent to Spotify's window, media key used as a fallback)
+SPOTIFY_ACTIONS = {"next": (11, 0xB0), "prev": (12, 0xB1), "toggle": (14, 0xB3)}
 
 if IS_WINDOWS:
     import ctypes
@@ -306,6 +319,9 @@ if IS_WINDOWS:
     _sig(user32.GetWindowLongW, [wintypes.HWND, ctypes.c_int], ctypes.c_long)
     _sig(user32.ShowWindowAsync, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
     _sig(user32.ShowWindow, [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+    _sig(user32.PostMessageW,
+         [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL)
+    _sig(user32.keybd_event, [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t], None)
     _sig(user32.SetForegroundWindow, [wintypes.HWND], wintypes.BOOL)
     _sig(user32.FindWindowW, [wintypes.LPCWSTR, wintypes.LPCWSTR], wintypes.HWND)
     _sig(user32.MessageBoxW,
@@ -414,12 +430,64 @@ if IS_WINDOWS:
     def minimize_window(hwnd):
         user32.ShowWindowAsync(hwnd, SW_MINIMIZE)
 
+    def find_spotify_window():
+        """(hwnd, title) of the Spotify desktop app's main window, or (None, '').
+        Hidden windows count too, so it still works when Spotify sits in the tray."""
+        found = []
+
+        def cb(hwnd, _lparam):
+            try:
+                cbuf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, cbuf, 64)
+                if not cbuf.value.startswith("Chrome_WidgetWin"):
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if exe_name_for_pid(pid.value) != "spotify.exe":
+                    return True
+                tbuf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, tbuf, n + 1)
+                found.append((not user32.IsWindowVisible(hwnd), hwnd, tbuf.value))
+            except Exception:
+                pass
+            return True
+
+        proc = WNDENUMPROC(cb)
+        user32.EnumWindows(proc, 0)
+        if not found:
+            return None, ""
+        found.sort(key=lambda f: f[0])          # visible windows first
+        return found[0][1], found[0][2]
+
+    def spotify_send(hwnd, action, use_keys=False):
+        command, vk = SPOTIFY_ACTIONS[action]
+        if use_keys:
+            user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+        else:
+            user32.PostMessageW(hwnd, WM_APPCOMMAND, 0, command << 16)
+
+    def launch_spotify():
+        for target in ("spotify:", os.path.join(_APPDATA, "Spotify", "Spotify.exe")):
+            try:
+                os.startfile(target)
+                return True
+            except OSError:
+                continue
+        return False
+
 else:  # lets the logic be imported/tested off-Windows
     def exe_name_for_pid(pid): return ""
     def foreground_exe(): return ""
     def get_monitors(): return []
     def list_app_windows(exclude_pids=(), include_minimized=False): return []
     def minimize_window(hwnd): pass
+    def find_spotify_window(): return None, ""
+    def spotify_send(hwnd, action, use_keys=False): pass
+    def launch_spotify(): return False
 
 
 # ---- Only one copy at a time -----------------------------------------------
@@ -449,6 +517,94 @@ def activate_existing_instance():
     user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
     user32.SetForegroundWindow(hwnd)
     return True
+
+
+# ============================================================================
+#  Spotify (desktop app): song from its window title, controls via messages
+# ============================================================================
+SPOTIFY_GREEN = "#1db954"
+SPOTIFY_IDLE_TITLES = {"spotify", "spotify premium", "spotify free"}
+
+
+def parse_spotify_title(title):
+    """Spotify's window title is 'Artist - Song' while playing, 'Spotify Premium' when paused.
+    Returns (playing, song, artist); song is None when nothing is playing."""
+    t = (title or "").strip()
+    if not t or t.lower() in SPOTIFY_IDLE_TITLES:
+        return False, None, None
+    if " - " in t:
+        artist, song = t.split(" - ", 1)
+        return True, song.strip(), artist.strip()
+    return True, t, ""                       # e.g. "Advertisement"
+
+
+class SpotifyWatcher:
+    def __init__(self):
+        self.hwnd = None
+        self.title = ""
+        self.playing = False
+        self.song = ""
+        self.artist = ""
+        self.played = 999.0          # seconds of the current song seen playing (999 = unknown)
+        self.use_keys = False        # Spotify ignored our window message: use media keys
+        self._last = 0.0
+        self._check = None           # (due, title before, action) to confirm a command worked
+
+    @property
+    def running(self):
+        return self.hwnd is not None
+
+    def poll(self):
+        now = time.monotonic()
+        hwnd, title = find_spotify_window()
+        self.hwnd, self.title = hwnd, title
+        playing, song, artist = parse_spotify_title(title) if hwnd else (False, None, None)
+        if song is not None and (song, artist) != (self.song, self.artist):
+            # Only trust "it just started" if we were watching when it changed.
+            self.played = 0.0 if now - self._last < 2.5 else 999.0
+            self.song, self.artist = song, artist
+        elif self.playing and playing:
+            self.played += now - self._last
+        self.playing = playing
+        self._last = now
+        if self._check and now >= self._check[0]:
+            _due, before, action = self._check
+            self._check = None
+            if hwnd and title == before and not self.use_keys:
+                self.use_keys = True
+                self._send(action, 1)
+
+    def command(self, action):
+        """action: 'next' | 'prev' | 'toggle'."""
+        if not self.hwnd:
+            return
+        presses = 1
+        if action == "prev":
+            # Spotify's "previous" restarts the song once it's a few seconds in;
+            # a second press then goes back to the song played before.
+            presses = 2 if self.played > 2.5 else 1
+            self.played = 0.0
+        else:
+            self._check = (time.monotonic() + 1.5, self.title, action)
+            if action == "toggle":
+                self.playing = not self.playing     # show it straight away
+            else:
+                self.played = 0.0
+        self._send(action, presses)
+
+    def _send(self, action, presses):
+        hwnd, keys = self.hwnd, self.use_keys
+
+        def run():
+            for i in range(presses):
+                if i:
+                    time.sleep(0.15)
+                try:
+                    spotify_send(hwnd, action, keys)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
 
 
 # ============================================================================
@@ -654,7 +810,11 @@ class TabServer:
         return time.time() - max(self.ext_at, self.poll_at) < 5
 
     def snapshot(self):
-        return {"active": self.active, "paused": self.paused, "exact": self.exact,
+        # During a break, report active=False so that even an extension from
+        # before breaks existed stops enforcing; "paused" tells newer versions
+        # to keep the session and return to the study tab afterwards.
+        on_break = self.active and self.paused
+        return {"active": self.active and not on_break, "paused": on_break, "exact": self.exact,
                 "session": self.session, "locked_url": self.locked_url,
                 "ext_version": self.ext_version}
 
@@ -728,7 +888,7 @@ class TabServer:
 # ============================================================================
 #  The Chrome extension (written to disk by the "Install" button)
 # ============================================================================
-EXT_VERSION = "1.1"
+EXT_VERSION = "1.2"
 
 EXT_MANIFEST = r"""{
   "manifest_version": 3,
@@ -864,11 +1024,12 @@ async function poll() {
     if (state && Date.now() - lastOk > GIVE_UP_MS) await unlock();
     return;
   }
-  if (s.active) {
+  if (s.paused && s.session) {          // on a break: stop enforcing, keep the session
+    if (state && state.session !== s.session) await unlock();
+    if (state && !state.paused) await pause();
+  } else if (s.active) {
     if (state && state.session !== s.session) await unlock();   // left over from an old session
-    if (s.paused) {
-      if (state && !state.paused) await pause();
-    } else if (!state) {
+    if (!state) {
       await lock(s);
     } else if (state.paused) {
       await resume();
@@ -1725,6 +1886,147 @@ class Ring(tk.Canvas):
             self.itemconfig(self.top_id, text=top)
 
 
+class SpotifyCard(tk.Canvas):
+    """Now playing + back / play-pause / skip for the Spotify desktop app."""
+
+    def __init__(self, parent, watcher, width, height):
+        super().__init__(parent, width=width, height=height, bg=parent["bg"],
+                         highlightthickness=0, bd=0)
+        self.watcher, self.w, self.h = watcher, width, height
+        self.f_song = bold(10)
+        self.f_sub = tkfont.Font(family=FONT, size=9)
+        self.f_tag = bold(7)
+        self.hover = None
+        self.hits = {}               # name -> (x1, y1, x2, y2)
+        self._sig = None
+        self.bind("<Motion>", lambda e: self._set_hover(self._hit(e.x, e.y)))
+        self.bind("<Leave>", lambda e: self._set_hover(None))
+        self.bind("<Button-1>", self._click)
+        self.refresh()
+
+    def _hit(self, x, y):
+        for name, (x1, y1, x2, y2) in self.hits.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return name
+        return None
+
+    def _set_hover(self, name):
+        if name != self.hover:
+            self.hover = name
+            self.configure(cursor="hand2" if name else "arrow")
+            self.refresh()
+
+    def _click(self, e):
+        name = self._hit(e.x, e.y)
+        if name == "open":
+            launch_spotify()
+        elif name:
+            self.watcher.command(name)
+        else:
+            return
+        self.refresh()
+        self.after(450, self._repoll)
+
+    def _repoll(self):
+        try:
+            if self.winfo_exists():
+                self.watcher.poll()
+                self.refresh()
+        except tk.TclError:
+            pass
+
+    def _fit(self, text, font, width):
+        if font.measure(text) <= width:
+            return text
+        while text and font.measure(text + "…") > width:
+            text = text[:-1]
+        return text.rstrip() + "…"
+
+    def refresh(self):
+        wt = self.watcher
+        sig = (wt.running, wt.playing, wt.song, wt.artist, self.hover)
+        if sig != self._sig:
+            self._sig = sig
+            self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        self.hits = {}
+        w, h, p, wt = self.w, self.h, px(12), self.watcher
+        round_rect(self, 1, 1, w - 2, h - 2, px(16), fill=SURFACE, outline=BORDER)
+
+        # header: logo, label, state
+        r = px(6)
+        lx, ly = p + r, p + r
+        self.create_oval(lx - r, ly - r, lx + r, ly + r, fill=SPOTIFY_GREEN, outline="")
+        for k, (half, dy) in enumerate(((0.62, -0.32), (0.5, 0.02), (0.38, 0.33))):
+            a = r * half
+            y = ly + r * dy
+            self.create_line(lx - a, y, lx, y - r * 0.12, lx + a, y + r * 0.04, smooth=True,
+                             fill=INK, width=max(1, px(1.6) - k * 0.2), capstyle="round")
+        self.create_text(lx + r + px(6), ly, anchor="w", text="SPOTIFY", font=self.f_tag, fill=SUBTLE)
+        if not wt.running:
+            state, color = "Not open", SUBTLE
+        elif wt.playing:
+            state, color = "Playing", SPOTIFY_GREEN
+        else:
+            state, color = "Paused", MUTED
+        self.create_text(w - p, ly, anchor="e", text=state, font=self.f_tag, fill=color)
+
+        # song + artist
+        if not wt.running:
+            song, sub = "Spotify isn't open", "Open it to control music here"
+        elif wt.song:
+            song, sub = wt.song, wt.artist
+        else:
+            song, sub = "Nothing playing", "Press play to start"
+        tw = w - 2 * p
+        y = ly + r + px(6)
+        self.create_text(p, y, anchor="nw", text=self._fit(song, self.f_song, tw),
+                         font=self.f_song, fill=FG)
+        y += self.f_song.metrics("linespace")
+        self.create_text(p, y, anchor="nw", text=self._fit(sub or "", self.f_sub, tw),
+                         font=self.f_sub, fill=MUTED)
+
+        # controls
+        cy = h - p - px(14)
+        if not wt.running:
+            bw, bh = px(112), px(26)
+            x1, y1 = (w - bw) / 2.0, cy - bh / 2.0
+            fill = PANEL_HI if self.hover == "open" else PANEL
+            round_rect(self, x1, y1, x1 + bw, y1 + bh, bh / 2.0, fill=fill, outline=fill)
+            self.create_text(w / 2.0, cy, text="Open Spotify", font=self.f_tag, fill=FG)
+            self.hits["open"] = (x1, y1, x1 + bw, y1 + bh)
+            return
+        gap = px(40)
+        for name, cx in (("prev", w / 2.0 - gap), ("toggle", w / 2.0), ("next", w / 2.0 + gap)):
+            big = name == "toggle"
+            d = px(30) if big else px(26)
+            hov = self.hover == name
+            if big:
+                fill = "#1ed760" if hov else SPOTIFY_GREEN
+            else:
+                fill = PANEL_HI if hov else None
+            if fill:
+                self.create_oval(cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2, fill=fill, outline="")
+            self.hits[name] = (cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2)
+            ink = INK if big else FG
+            s = px(5)
+            if name == "toggle" and wt.playing:          # pause
+                bwid = px(3)
+                for x in (cx - px(4.5), cx + px(1.5)):
+                    self.create_rectangle(x, cy - s, x + bwid, cy + s, fill=ink, outline="")
+            elif name == "toggle":                        # play
+                self.create_polygon(cx - s * 0.6, cy - s * 1.05, cx - s * 0.6, cy + s * 1.05,
+                                    cx + s * 1.05, cy, fill=ink, outline="")
+            else:
+                sign = 1 if name == "next" else -1
+                tip, base = cx + sign * s * 0.55, cx - sign * s * 0.85
+                self.create_polygon(base, cy - s, base, cy + s, tip, cy, fill=ink, outline="")
+                bx = tip if sign > 0 else tip - px(2)
+                self.create_rectangle(bx, cy - s, bx + px(2), cy + s, fill=ink, outline="")
+
+
 def section(parent, text, pady=(16, 7)):
     lab = tk.Label(parent, text=text.upper(), bg=parent["bg"], fg=SUBTLE, font=(FONT, 8, "bold"))
     lab.pack(anchor="w", pady=(px(pady[0]), px(pady[1])))
@@ -1778,6 +2080,9 @@ class FocusLock(tk.Tk):
         self._last_relaunch = 0.0
         self._status_token = None
         self._break_armed_until = 0.0
+        self.spotify = SpotifyWatcher()
+        self.spotify_on = False
+        self.spotify_card = None
 
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(expand=True, fill="both")
@@ -1793,6 +2098,7 @@ class FocusLock(tk.Tk):
     def clear(self):
         self.unbind("<Return>")
         self.ring = None
+        self.spotify_card = None
         for w in self.container.winfo_children():
             w.destroy()
 
@@ -1935,6 +2241,9 @@ class FocusLock(tk.Tk):
                   padx=11).pack(side="left")
         RoundEntry(r, self.minutes_var, px(62), justify="center").pack(side="left", padx=(px(8), 0))
         label(r, "min", 10, MUTED).pack(side="left", padx=(px(6), 0))
+        self.spotify_var = tk.BooleanVar(value=bool(s["spotify"]))
+        Toggle(left, "Spotify controls", self.spotify_var,
+               sub="Song, skip and back next to the timer").pack(anchor="w", pady=(px(14), 0))
 
         section(right, "Breaks")
         r = tk.Frame(right, bg=BG)
@@ -2083,12 +2392,18 @@ class FocusLock(tk.Tk):
         if not self.tabsrv.connected():
             return SUBTLE, "Extension not connected. Open Chrome, or install it below.", False
         info = self.tabsrv.ext
-        if version_tuple(info.get("version") or "1.0") < version_tuple(EXT_VERSION):
-            return WARN, ("Extension is out of date. Click Install extension, then "
-                          "the reload arrow on Focus Lock in chrome://extensions."), False
+        if self.ext_outdated():
+            return WARN, ("Extension needs a reload: open its settings and click the "
+                          "reload arrow on Focus Lock."), True
         if info.get("incognito") is False:
             return WARN, "Connected, but not allowed in Incognito.", True
         return GOOD, "Extension connected", False
+
+    def ext_outdated(self):
+        # Chrome keeps running the old code until the extension is reloaded,
+        # even though the app has already rewritten its files.
+        return (self.tabsrv.connected() and version_tuple(self.tabsrv.ext.get("version") or "1.0")
+                < version_tuple(EXT_VERSION))
 
     def update_ext_status(self, token):
         if token is not self._status_token or self.phase not in ("setup", "starting"):
@@ -2184,11 +2499,13 @@ class FocusLock(tk.Tk):
                          "exact": bool(self.exact_var.get()),
                          "apps": apps, "extra": extra,
                          "breaks": self.breaks_var.get(),
-                         "break_minutes": self.break_min_var.get()}
+                         "break_minutes": self.break_min_var.get(),
+                         "spotify": bool(self.spotify_var.get())}
         save_settings(self.settings)
 
         params = {"minutes": minutes, "mode": mode, "allowed": allowed, "lock_tab": lock_tab,
-                  "breaks": self.breaks_var.get(), "break_minutes": self.break_min_var.get()}
+                  "breaks": self.breaks_var.get(), "break_minutes": self.break_min_var.get(),
+                  "spotify": bool(self.spotify_var.get())}
         if not lock_tab:
             self.begin_session(params)
             return
@@ -2256,6 +2573,7 @@ class FocusLock(tk.Tk):
         self.breaks_total = self.breaks_left = int(p["breaks"])
         self.break_secs = int(p["break_minutes"]) * 60
         self.session_focus = 0.0
+        self.spotify_on = bool(p.get("spotify"))
         self.enter_focus()
 
     # ---- focus -------------------------------------------------------------
@@ -2282,6 +2600,8 @@ class FocusLock(tk.Tk):
             self.keep_focus(gen)
         else:
             self.guard_tick(gen)
+        if self.spotify_card is not None:
+            self.spotify_tick(gen)
 
     def _break_button(self, parent, size, small):
         if not self.breaks_total:
@@ -2329,19 +2649,24 @@ class FocusLock(tk.Tk):
         c = self.container
         center = tk.Frame(c, bg=BG)
         center.place(relx=0.5, rely=0.48, anchor="center")
-        size = int(min(ph * 0.56, pw * 0.42))
+        size = int(min(ph * (0.5 if self.spotify_on else 0.56), pw * 0.42))
         label(center, "F O C U S", 12, SUBTLE, "bold").pack(pady=(0, px(20)))
         self.ring = Ring(center, size, max(px(10), int(size * 0.035)), ticks=60,
                          sub_px=max(px(12), int(size * 0.042)))
         self.ring.pack()
         label(center, "Stay on this screen. You've got this.", 13, MUTED).pack(pady=(px(28), px(16)))
-        self.actions = tk.Frame(center, bg=BG)
+        self.actions = tk.Frame(center, bg=BG)       # buttons + Spotify, hidden by the quit prompt
         self.actions.pack()
-        self.break_btn = self._break_button(self.actions, 11, small=False)
+        btns = tk.Frame(self.actions, bg=BG)
+        btns.pack()
+        self.break_btn = self._break_button(btns, 11, small=False)
         if self.break_btn:
             self.break_btn.pack(side="left", padx=(0, px(10)))
-        RoundButton(self.actions, "End early", self.show_quit_prompt, kind="ghost", size=10,
+        RoundButton(btns, "End early", self.show_quit_prompt, kind="ghost", size=10,
                     hover_fg=DANGER, padx=18, pady=9).pack(side="left")
+        if self.spotify_on:
+            self.spotify_card = SpotifyCard(self.actions, self.spotify, px(300), px(108))
+            self.spotify_card.pack(pady=(px(22), 0))
         self.exit_frame = tk.Frame(center, bg=BG)
         self.exit_frame.pack()
         self._show_actions = lambda: self.actions.pack(before=self.exit_frame)
@@ -2378,6 +2703,7 @@ class FocusLock(tk.Tk):
         self.ring.pack(side="left")
         col = tk.Frame(row, bg=BG)
         col.pack(side="left", padx=(px(14), 0))
+        self.bar_row = row
         self.exit_frame = tk.Frame(c, bg=BG)
         self.exit_frame.pack(anchor="w")
         return col
@@ -2395,12 +2721,17 @@ class FocusLock(tk.Tk):
         RoundButton(self.actions, "End early", self.show_quit_prompt, kind="ghost", size=9,
                     hover_fg=DANGER, padx=12, pady=5).pack(side="left")
         self._show_actions = lambda: self.actions.pack(anchor="w", pady=(px(8), 0))
+        if self.spotify_on:
+            self.spotify_card = SpotifyCard(self.bar_row, self.spotify, px(236), px(108))
+            self.spotify_card.pack(side="left", padx=(px(18), 0))
         self.update_bar_status()
         self.place_top_center()
 
     def update_bar_status(self):
         if self.tab_locked:
-            if time.time() - self.tabsrv.status_at < 6:
+            if self.ext_outdated():
+                text, color = "●  Reload the Focus Lock extension", WARN
+            elif time.time() - self.tabsrv.status_at < 6:
                 text, color = "●  Chrome tab locked", GOOD
             else:
                 text, color = "●  Waiting for Chrome...", WARN
@@ -2524,6 +2855,16 @@ class FocusLock(tk.Tk):
             self.ring.set(remaining / self.total_seconds, text)
             self.update_bar_status()
         self.after(200, self.tick, gen)
+
+    def spotify_tick(self, gen):
+        if gen != self.gen or self.spotify_card is None:
+            return
+        try:
+            self.spotify.poll()
+            self.spotify_card.refresh()
+        except tk.TclError:
+            return
+        self.after(1000, self.spotify_tick, gen)
 
     def keep_focus(self, gen):
         """Full lock: stay on top of everything, except Task Manager."""

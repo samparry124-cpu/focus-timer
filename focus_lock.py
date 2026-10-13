@@ -955,44 +955,45 @@ elif IS_MAC:
                  'if application id "com.spotify.client" is not running then return "NOTRUNNING"',
                  "on error", 'return "NOTINSTALLED"', "end try",
                  "return run script (item 1 of argv)", "end run"]
+    # (Variable names are long on purpose: short ones like "st" are AppleScript keywords.)
     _AS_STATUS = """
-on fld(v)
-    if v is missing value then return ""
+on fieldText(theValue)
+    if theValue is missing value then return ""
     try
-        return v as text
+        return theValue as text
     on error
         return ""
     end try
-end fld
-set st to "stopped"
-set nm to ""
-set ar to ""
-set po to 0
+end fieldText
+set stateText to "stopped"
+set trackName to ""
+set artistName to ""
+set positionSecs to 0
 tell application id "com.spotify.client"
     with timeout of TIMEOUT seconds
-        set ps to player state
-        if ps is playing then
-            set st to "playing"
-        else if ps is paused then
-            set st to "paused"
+        set rawState to player state
+        if rawState is playing then
+            set stateText to "playing"
+        else if rawState is paused then
+            set stateText to "paused"
         end if
         try
-            set nm to name of current track
-            set ar to artist of current track
+            set trackName to name of current track
+            set artistName to artist of current track
         end try
         try
-            set po to player position
+            set positionSecs to player position
         end try
     end timeout
 end tell
-set posMs to 0
+set positionMs to 0
 try
-    set posMs to (po * 1000) div 1
+    set positionMs to (positionSecs * 1000) div 1
 end try
 set AppleScript's text item delimiters to character id 31
-set res to {"OK", st, fld(nm), fld(ar), fld(posMs)} as text
+set resultText to {"OK", stateText, fieldText(trackName), fieldText(artistName), fieldText(positionMs)} as text
 set AppleScript's text item delimiters to ""
-return res
+return resultText
 """
     _AS_COMMANDS = {"next": "next track", "toggle": "playpause",
                     # past ~3 s, "previous track" only restarts the song: press it twice then

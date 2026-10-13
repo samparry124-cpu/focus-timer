@@ -969,7 +969,7 @@ set nm to ""
 set ar to ""
 set po to 0
 tell application id "com.spotify.client"
-    with timeout of 5 seconds
+    with timeout of TIMEOUT seconds
         set ps to player state
         if ps is playing then
             set st to "playing"
@@ -1007,6 +1007,7 @@ return res
             self.wanted_until = 0.0
             self.thread = None
             self.asked = False       # True once macOS answered the "control Spotify" question
+            self.detail = ""         # last AppleScript error text (shown by --check)
 
         def want(self):
             self.wanted_until = time.monotonic() + 5
@@ -1027,8 +1028,14 @@ return res
                 return None, None
             if p.returncode == 0:
                 return p.stdout.decode("utf-8", "replace").strip("\r\n"), None
-            m = re.search(r"\((-?\d+)\)\s*$", p.stderr.decode("utf-8", "replace").strip())
+            self.detail = p.stderr.decode("utf-8", "replace").strip()
+            m = re.search(r"\((-?\d+)\)\s*$", self.detail)
             return None, int(m.group(1)) if m else -1
+
+        def _wait(self):
+            # Until macOS has asked "Terminal wants to control Spotify", give the person time
+            # to click OK (the request waits for the answer); afterwards fail fast.
+            return 8 if self.asked else 120
 
         def _running(self):
             try:
@@ -1041,7 +1048,7 @@ return res
             if not self._running():
                 self.state = dict(self.state, handle=None, playing=False, error=None)
                 return
-            out, err = self._osascript(_AS_STATUS)
+            out, err = self._osascript(_AS_STATUS.replace("TIMEOUT", str(self._wait())))
             if err is not None:
                 if err == SPOTIFY_DENIED:
                     self.asked = True
@@ -1072,8 +1079,8 @@ return res
                     action = None
                 if action in _AS_COMMANDS:
                     self._osascript('tell application id "com.spotify.client"\n'
-                                    "with timeout of 5 seconds\n%s\nend timeout\nend tell\n"
-                                    'return "OK"' % _AS_COMMANDS[action])
+                                    "with timeout of %d seconds\n%s\nend timeout\nend tell\n"
+                                    'return "OK"' % (self._wait(), _AS_COMMANDS[action]))
                 if action or time.monotonic() < self.wanted_until:
                     self._poll()
 
@@ -1185,6 +1192,7 @@ def activate_existing_instance():
 # ============================================================================
 SPOTIFY_GREEN = "#1db954"
 SPOTIFY_DENIED = -1743           # macOS: the user hasn't allowed us to control Spotify
+SPOTIFY_TIMEOUT = -1712          # no reply in time (e.g. the permission prompt is still open)
 SPOTIFY_VERIFY = not IS_MAC      # title backend: retry with media keys if Spotify ignored a message
 SPOTIFY_IDLE_TITLES = {"spotify", "spotify premium", "spotify free"}
 
@@ -2733,8 +2741,10 @@ class SpotifyCard(tk.Canvas):
             song, sub = "Spotify isn't open", "Open it to control music here"
         elif wt.error == SPOTIFY_DENIED:
             song, sub = "Allow access to Spotify", "Privacy & Security > Automation"
+        elif wt.error == SPOTIFY_TIMEOUT:
+            song, sub = "Spotify didn't reply", "Click OK if macOS asks about Spotify"
         elif wt.error is not None:
-            song, sub = "Spotify isn't answering", "Is a permission prompt waiting?"
+            song, sub = "Spotify isn't answering", "Error %s - run focus_lock.py --check" % wt.error
         elif wt.song:
             song, sub = wt.song, wt.artist
         else:
@@ -4247,13 +4257,16 @@ def run_checks():
             if not _spotify._running():
                 report(None, "Spotify", "not running - open it and run the check again")
                 return
+            print("      (if macOS asks whether your Terminal may control Spotify, click OK)",
+                  flush=True)
             _spotify._poll()
             st = _spotify.state
             if st.get("error") == SPOTIFY_DENIED:
                 report(False, "Spotify control", "not allowed - System Settings > Privacy & "
                        "Security > Automation > (your terminal) > Spotify")
             elif st.get("error") is not None:
-                report(False, "Spotify control", "AppleScript error %s" % st["error"])
+                report(False, "Spotify control", "AppleScript error %s: %s"
+                       % (st["error"], _spotify.detail or "no details"))
             else:
                 report(True, "Spotify control", "%s - %s (%s)" % (
                     st.get("artist"), st.get("song"), "playing" if st.get("playing") else "paused"))

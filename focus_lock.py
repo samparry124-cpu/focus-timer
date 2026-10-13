@@ -969,6 +969,7 @@ set stateText to "stopped"
 set trackName to ""
 set artistName to ""
 set positionSecs to 0
+if application id "com.spotify.client" is not running then return "NOTRUNNING"
 tell application id "com.spotify.client"
     with timeout of TIMEOUT seconds
         set rawState to player state
@@ -980,9 +981,13 @@ tell application id "com.spotify.client"
         try
             set trackName to name of current track
             set artistName to artist of current track
+        on error number errNum
+            if errNum is in {-1712, -600, -609} then error number errNum
         end try
         try
             set positionSecs to player position
+        on error number errNum
+            if errNum is in {-1712, -600, -609} then error number errNum
         end try
     end timeout
 end tell
@@ -1009,6 +1014,8 @@ return resultText
             self.thread = None
             self.asked = False       # True once macOS answered the "control Spotify" question
             self.detail = ""         # last AppleScript error text (shown by --check)
+            self.busy_since = None   # when the osascript call now running started
+            self.pending = False     # first request in flight: macOS may be asking right now
 
         def want(self):
             self.wanted_until = time.monotonic() + 5
@@ -1021,12 +1028,19 @@ return resultText
             for line in _AS_OUTER:
                 args += ["-e", line]
             args.append(inner)
+            self.busy_since = time.monotonic()
             try:
                 p = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, timeout=timeout,
                                    env=dict(os.environ, LANG="en_US.UTF-8"))
-            except (OSError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
+                self.detail = "osascript gave no answer in %d s" % timeout
+                return None, SPOTIFY_TIMEOUT
+            except OSError as e:
+                self.detail = str(e)
                 return None, None
+            finally:
+                self.busy_since = None
             if p.returncode == 0:
                 return p.stdout.decode("utf-8", "replace").strip("\r\n"), None
             self.detail = p.stderr.decode("utf-8", "replace").strip()
@@ -1049,7 +1063,13 @@ return resultText
             if not self._running():
                 self.state = dict(self.state, handle=None, playing=False, error=None)
                 return
+            first = not self.asked
+            self.pending = first
             out, err = self._osascript(_AS_STATUS.replace("TIMEOUT", str(self._wait())))
+            self.pending = first and err == SPOTIFY_TIMEOUT
+            if err in (-600, -609):            # Spotify quit in the middle of the request
+                self.state = dict(self.state, handle=None, playing=False, error=None)
+                return
             if err is not None:
                 if err == SPOTIFY_DENIED:
                     self.asked = True
@@ -1075,11 +1095,15 @@ return resultText
         def _run(self):
             while True:
                 try:
-                    action = self.cmds.get(timeout=1.0)
+                    action, queued = self.cmds.get(timeout=1.0)
+                    if time.monotonic() - queued > 3:   # clicked while a call was stuck
+                        action = "stale"                # don't replay it; just refresh
                 except queue.Empty:
                     action = None
                 if action in _AS_COMMANDS:
-                    self._osascript('tell application id "com.spotify.client"\n'
+                    self._osascript('if application id "com.spotify.client" is not running '
+                                    'then return "NOTRUNNING"\n'
+                                    'tell application id "com.spotify.client"\n'
                                     "with timeout of %d seconds\n%s\nend timeout\nend tell\n"
                                     'return "OK"' % (self._wait(), _AS_COMMANDS[action]))
                 if action or time.monotonic() < self.wanted_until:
@@ -1089,7 +1113,13 @@ return resultText
 
     def _mac_spotify_state():
         _spotify.want()
-        return dict(_spotify.state)
+        st = dict(_spotify.state)
+        since = _spotify.busy_since
+        if (since is not None and time.monotonic() - since > 2.5
+                and st["error"] in (None, SPOTIFY_TIMEOUT)):
+            # a request is stuck - on a first run that's macOS asking "control Spotify?"
+            st.update(handle=True, error=SPOTIFY_TIMEOUT)
+        return st
 
     def find_spotify_window():
         st = _mac_spotify_state()
@@ -1097,7 +1127,7 @@ return resultText
 
     def spotify_send(handle, action, use_keys=False):
         _spotify.want()
-        _spotify.cmds.put(action)
+        _spotify.cmds.put((action, time.monotonic()))
 
     def launch_spotify():
         try:
@@ -2743,7 +2773,7 @@ class SpotifyCard(tk.Canvas):
         elif wt.error == SPOTIFY_DENIED:
             song, sub = "Allow access to Spotify", "Privacy & Security > Automation"
         elif wt.error == SPOTIFY_TIMEOUT:
-            song, sub = "Spotify didn't reply", "Click OK if macOS asks about Spotify"
+            song, sub = "Waiting for Spotify", "Click OK if macOS asks about Spotify"
         elif wt.error is not None:
             song, sub = "Spotify isn't answering", "Error %s - run focus_lock.py --check" % wt.error
         elif wt.song:
@@ -3481,6 +3511,10 @@ class FocusLock(tk.Tk):
             return
 
         mode = self.mode_var.get()
+        if IS_MAC and mode == "full" and self.spotify_var.get() and _spotify.pending:
+            self.set_message("Answer the macOS question about controlling Spotify first "
+                             "(or turn Spotify controls off).")
+            return
         apps = self.selected_exes()
         extra = self.extra_var.get().strip()
         allowed, lock_tab = set(), False
@@ -3944,7 +3978,7 @@ class FocusLock(tk.Tk):
         self._lock_baseline &= current             # a closed-then-reopened panel counts as new
         force_quit = bool(current - self._lock_baseline)
         escape = bundle in MAC_ESCAPE_BUNDLES
-        if self.lock_win.state() != "normal":      # e.g. minimised: put it back
+        if self.lock_win.state() in ("iconic", "withdrawn"):   # e.g. Cmd+M: put it back
             self.lock_win.deiconify()
         x, y, w, h = self._lock_rect
         want = "%dx%d+%d+%d" % (w, h, x, y)
@@ -3952,10 +3986,12 @@ class FocusLock(tk.Tk):
             self.lock_win.geometry(want)
         for win in windows:                        # step aside so you can end us
             set_window_level(win, LEVEL_NORMAL if (force_quit or escape) else LEVEL_LOCK)
-        if escape or force_quit:                   # never take focus from Force Quit
+        if escape:                                 # Force Quit / Activity Monitor / a prompt
             return
         if pid is not None and pid != os.getpid():  # something else got activated: take it back
-            activate_self()
+            activate_self()                         # (a Force Quit panel still floats above)
+            if force_quit:                          # but don't take the keyboard from it
+                return
             target = self.quit_entry if self.quit_entry is not None else self.lock_win
             try:
                 target.focus_force()
@@ -4268,6 +4304,9 @@ def run_checks():
             elif st.get("error") is not None:
                 report(False, "Spotify control", "AppleScript error %s: %s"
                        % (st["error"], _spotify.detail or "no details"))
+            elif not st.get("handle"):
+                report(False, "Spotify control", "no answer - %s" % (_spotify.detail or
+                                                                    "is Spotify still running?"))
             else:
                 report(True, "Spotify control", "%s - %s (%s)" % (
                     st.get("artist"), st.get("song"), "playing" if st.get("playing") else "paused"))

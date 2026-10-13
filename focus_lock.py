@@ -23,7 +23,9 @@ REST STOPWATCH
   can be paused (showing how long it has been paused), and shows today's rest
   next to today's focus. The ring turns amber after 30 min and red after
   60 min. Clicking it doesn't take focus from the game; drag it anywhere.
-  Stop returns to the home screen.
+  Stop returns to the home screen. (On a Mac it floats over normal windows on
+  every desktop, but not over apps in their own full-screen Space, and
+  clicking it brings Focus Lock to the front.)
 
 SPOTIFY
   With "Spotify controls" on, a card next to the timer shows what the Spotify
@@ -54,7 +56,7 @@ MAC
     lock steps aside while it is open.
   - Study mode hides apps you haven't allowed (like Cmd+H). Finder, Activity
     Monitor and the Terminal you started from are never hidden. Type app names
-    as they appear in the Dock, e.g. "Notion, Spotify".
+    as Finder shows them, e.g. "Notion, Spotify" (".app" is optional).
   - Spotify is controlled through AppleScript. The first time, macOS asks
     whether your Terminal may control Spotify - click OK.
   - Keyboard blocking (Win key etc.) is Windows-only; the Chrome tab lock works
@@ -63,7 +65,8 @@ MAC
 EMERGENCY EXITS (deliberately left open so you can never be trapped)
   - Click "End early" and type the phrase.
   - Ctrl+Alt+Del -> Task Manager (Mac: Cmd+Option+Esc -> Force Quit). While
-    it is in front, Full lock steps aside so you can end it.
+    it is in front, Full lock steps aside so you can end it. (Mac, blind if
+    needed: Cmd+Option+Esc, choose Python, Return, Return.)
   - If this program dies, Chrome unlocks itself ~10 seconds later and the
     keyboard hook disappears with the process.
 """
@@ -156,7 +159,11 @@ def parse_exes(text):
     for tok in text.replace(";", ",").replace("\n", ",").split(","):
         tok = tok.strip().lower()
         if tok:
-            out.add(tok if "." in tok or not IS_WINDOWS else tok + ".exe")
+            if IS_MAC:
+                tok = tok.strip("\"'")
+                out.add(tok[:-4] if tok.endswith(".app") else tok)
+            else:
+                out.add(tok if "." in tok else tok + ".exe")
     return out
 
 
@@ -739,6 +746,8 @@ elif IS_MAC:
     def nswindow(win):
         """NSWindow* behind a Tk toplevel (None until it has been mapped)."""
         try:
+            if win.tk.call("tk", "windowingsystem") != "aqua":   # X11 Tk: ids aren't pointers
+                return None
             win.update_idletasks()
             ident = win.winfo_id()
         except tk.TclError:
@@ -757,11 +766,13 @@ elif IS_MAC:
                 return w
         return None
 
-    def set_window_level(win, level, behavior=None, can_hide=None):
+    def set_window_level(win, level, behavior=None, can_hide=None, movable=None):
         with _Pool():
             nsw = nswindow(win)
             if not nsw:
                 return False
+            if movable is not None:
+                msg(nsw, "setMovable:", movable, restype=None, argtypes=(c_bool,))
             if behavior is not None:
                 msg(nsw, "setCollectionBehavior:", behavior, restype=None, argtypes=(c_ulong,))
             if can_hide is not None:
@@ -769,6 +780,11 @@ elif IS_MAC:
                 msg(nsw, "setHidesOnDeactivate:", False, restype=None, argtypes=(c_bool,))
             msg(nsw, "setLevel:", level, restype=None, argtypes=(c_long,))
             return True
+
+    def has_title_bar(win):
+        with _Pool():
+            nsw = nswindow(win)
+            return bool(nsw) and bool(msg(nsw, "styleMask", restype=c_ulong) & 1)   # Titled
 
     def make_overlay(win):
         set_window_level(win, LEVEL_STATUS, CB_EVERYWHERE, can_hide=False)
@@ -821,7 +837,20 @@ elif IS_MAC:
         "com.apple.controlcenter", "com.apple.notificationcenterui", "com.apple.spotlight",
         "com.apple.securityagent", "com.apple.coreservices.uiagent",
         "com.apple.usernotificationcenter", "com.apple.terminal", "com.googlecode.iterm2",
+        "com.mitchellh.ghostty", "net.kovidgoyal.kitty", "org.alacritty",
+        "com.github.wez.wezterm", "dev.warp.warp-stable", "com.microsoft.vscode",
+        "com.jetbrains.pycharm", "com.jetbrains.pycharm.ce", "org.python.idle",
     }
+    _launcher = os.environ.get("__CFBundleIdentifier", "").lower()   # the app that started us
+    if _launcher:
+        NEVER_HIDE.add(_launcher)
+    # Apps the Full lock steps aside for (bundle ids - names are translated):
+    # Activity Monitor, Force Quit / login dialogs, password and permission prompts.
+    MAC_ESCAPE_BUNDLES = {"com.apple.activitymonitor", "com.apple.loginwindow", "com.apple.dock",
+                          "com.apple.securityagent", "com.apple.usernotificationcenter",
+                          "com.apple.tccd"}
+    CHROME_BUNDLES = {"com.google.chrome", "com.google.chrome.beta", "com.google.chrome.dev",
+                      "com.google.chrome.canary"}
     _protected = None
 
     def _protected_pids():
@@ -847,7 +876,8 @@ elif IS_MAC:
         return _protected
 
     def _regular_apps(include_hidden):
-        """[(app, pid, bundle_id, name)] for Dock apps; `app` is only valid inside the pool."""
+        """[(app, pid, bundle_id, name, file_name)] for Dock apps; `app` is only valid inside
+        the pool. file_name is the .app name Finder shows, without ".app"."""
         out = []
         ws = msg(_cls("NSWorkspace"), "sharedWorkspace")
         for app in _items(msg(ws, "runningApplications")):
@@ -857,9 +887,13 @@ elif IS_MAC:
                 continue
             if not include_hidden and msg(app, "isHidden", restype=c_bool):
                 continue
+            url = msg(app, "bundleURL")
+            fname = _pystr(msg(url, "lastPathComponent")) if url else ""
+            if fname.lower().endswith(".app"):
+                fname = fname[:-4]
             out.append((app, msg(app, "processIdentifier", restype=c_int32),
                         _pystr(msg(app, "bundleIdentifier")).lower(),
-                        _pystr(msg(app, "localizedName"))))
+                        _pystr(msg(app, "localizedName")), fname.lower()))
         return out
 
     def list_app_windows(exclude_pids=(), include_minimized=False):
@@ -867,7 +901,7 @@ elif IS_MAC:
         with _Pool():
             protected = _protected_pids()
             return [(pid, pid, name.lower(), "")
-                    for _app, pid, bid, name in _regular_apps(include_minimized)
+                    for _app, pid, bid, name, _f in _regular_apps(include_minimized)
                     if name and pid not in exclude_pids and pid not in protected
                     and bid not in NEVER_HIDE]
 
@@ -883,15 +917,23 @@ elif IS_MAC:
         chrome = False
         with _Pool():
             protected = _protected_pids()
-            for app, pid, bid, name in _regular_apps(include_hidden=True):
+            for app, pid, bid, name, fname in _regular_apps(include_hidden=True):
                 key = name.lower()
-                if bid == "com.google.chrome":
+                if bid in CHROME_BUNDLES:
                     chrome = True
                 if (pid in protected or bid in NEVER_HIDE or key in allowed or bid in allowed
-                        or key in ALWAYS_ALLOWED or msg(app, "isHidden", restype=c_bool)):
+                        or fname in allowed or key in ALWAYS_ALLOWED
+                        or msg(app, "isHidden", restype=c_bool)):
                     continue
                 msg(app, "hide", restype=c_bool)
         return chrome
+
+    def app_installed(bundle_id):
+        with _Pool():
+            ws = msg(_cls("NSWorkspace"), "sharedWorkspace")
+            ns = msg(_cls("NSString"), "stringWithUTF8String:", bundle_id.encode("utf-8"),
+                     argtypes=(c_char_p,))
+            return bool(msg(ws, "URLForApplicationWithBundleIdentifier:", ns, argtypes=(c_void_p,)))
 
     def frontmost_app():
         """(pid, bundle_id, lower-case name) of the app receiving key events."""
@@ -914,6 +956,14 @@ elif IS_MAC:
                  "on error", 'return "NOTINSTALLED"', "end try",
                  "return run script (item 1 of argv)", "end run"]
     _AS_STATUS = """
+on fld(v)
+    if v is missing value then return ""
+    try
+        return v as text
+    on error
+        return ""
+    end try
+end fld
 set st to "stopped"
 set nm to ""
 set ar to ""
@@ -940,11 +990,13 @@ try
     set posMs to (po * 1000) div 1
 end try
 set AppleScript's text item delimiters to character id 31
-set res to {"OK", st, nm as text, ar as text, posMs as text} as text
+set res to {"OK", st, fld(nm), fld(ar), fld(posMs)} as text
 set AppleScript's text item delimiters to ""
 return res
 """
-    _AS_COMMANDS = {"next": "next track", "prev": "previous track", "toggle": "playpause"}
+    _AS_COMMANDS = {"next": "next track", "toggle": "playpause",
+                    # past ~3 s, "previous track" only restarts the song: press it twice then
+                    "prev": "if player position > 3 then previous track\nprevious track"}
     SPOTIFY_PERMISSION_ERROR = -1743
 
     class _MacSpotify:
@@ -954,6 +1006,7 @@ return res
             self.cmds = queue.Queue()
             self.wanted_until = 0.0
             self.thread = None
+            self.asked = False       # True once macOS answered the "control Spotify" question
 
         def want(self):
             self.wanted_until = time.monotonic() + 5
@@ -990,6 +1043,8 @@ return res
                 return
             out, err = self._osascript(_AS_STATUS)
             if err is not None:
+                if err == SPOTIFY_DENIED:
+                    self.asked = True
                 self.state = dict(self.state, handle=True, error=err)
                 return
             if not out or out in ("NOTRUNNING", "NOTINSTALLED"):
@@ -1004,6 +1059,7 @@ return res
             except ValueError:
                 position = None
             playing = st == "playing"
+            self.asked = True
             self.state = {"handle": True, "playing": playing, "song": name or None,
                           "artist": artist, "position": position, "error": None,
                           "title": "%s - %s" % (artist, name) if name else "Spotify"}
@@ -1205,7 +1261,7 @@ class SpotifyWatcher:
         if action == "prev":
             # Spotify's "previous" restarts the song once it's a few seconds in;
             # a second press then goes back to the song played before.
-            presses = 2 if self.played > 2.5 else 1
+            presses = 1 if IS_MAC else (2 if self.played > 2.5 else 1)
             self.played = 0.0
         else:
             self._check = (time.monotonic() + 1.5, self.title, action)
@@ -1370,6 +1426,8 @@ def play_chime(kind):
 def open_in_chrome(url):
     """Open a URL in the user's normal Chrome (starting Chrome if needed). True if launched."""
     if IS_MAC:
+        if not app_installed("com.google.Chrome"):
+            return False
         try:
             subprocess.Popen(["/usr/bin/open", "-b", "com.google.Chrome", url])
             return True
@@ -1487,7 +1545,7 @@ class TabServer:
         if not self.session or data.get("session") != self.session:
             return
         self.status = data
-        self.status_at = time.time()
+        self.status_at = time.monotonic()
         if data.get("locked") and data.get("url") and not self.locked_url:
             self.locked_url = str(data["url"])
 
@@ -2578,10 +2636,11 @@ class Ring(tk.Canvas):
 class SpotifyCard(tk.Canvas):
     """Now playing + back / play-pause / skip for the Spotify desktop app."""
 
-    def __init__(self, parent, watcher, width, height):
+    def __init__(self, parent, watcher, width, height, can_open_settings=True):
         super().__init__(parent, width=width, height=height, bg=parent["bg"],
                          highlightthickness=0, bd=0)
         self.watcher, self.w, self.h = watcher, width, height
+        self.can_open_settings = can_open_settings   # False under a Full lock (it'd be covered)
         self.f_song = bold(10)
         self.f_sub = tkfont.Font(family=FONT, size=fs(9))
         self.f_tag = bold(7)
@@ -2661,6 +2720,8 @@ class SpotifyCard(tk.Canvas):
             state, color = "Not open", SUBTLE
         elif wt.error == SPOTIFY_DENIED:
             state, color = "No access", WARN
+        elif wt.error is not None:
+            state, color = "Waiting", WARN
         elif wt.playing:
             state, color = "Playing", SPOTIFY_GREEN
         else:
@@ -2672,6 +2733,8 @@ class SpotifyCard(tk.Canvas):
             song, sub = "Spotify isn't open", "Open it to control music here"
         elif wt.error == SPOTIFY_DENIED:
             song, sub = "Allow access to Spotify", "Privacy & Security > Automation"
+        elif wt.error is not None:
+            song, sub = "Spotify isn't answering", "Is a permission prompt waiting?"
         elif wt.song:
             song, sub = wt.song, wt.artist
         else:
@@ -2686,6 +2749,10 @@ class SpotifyCard(tk.Canvas):
 
         # controls
         cy = h - p - px(14)
+        if wt.running and wt.error == SPOTIFY_DENIED and not self.can_open_settings:
+            self.create_text(w / 2.0, cy, text="Allow it in Settings after this session",
+                             font=self.f_sub, fill=MUTED)
+            return
         if not wt.running or wt.error == SPOTIFY_DENIED:
             text, name = ("Open Spotify", "open") if not wt.running else ("Open Settings", "settings")
             bw, bh = px(112), px(26)
@@ -2926,6 +2993,7 @@ class FocusLock(tk.Tk):
         if refresh_installed_extension():
             self.tabsrv.ext_version = EXT_VERSION
         self._last_relaunch = 0.0
+        self._revived = False
         self._status_token = None
         self._break_armed_until = 0.0
         self.spotify = SpotifyWatcher()
@@ -2941,6 +3009,14 @@ class FocusLock(tk.Tk):
         self._lock_armed = False
         self._lock_baseline = set()
         if IS_MAC:
+            if self.tk.call("tk", "windowingsystem") != "aqua":
+                print("Focus Lock needs the native macOS (Aqua) Tk, not an X11/XQuartz one.\n"
+                      "Install Python from https://www.python.org/downloads/macos/")
+                self.destroy()
+                sys.exit(1)
+            # loginwindow windows that exist before any session (not Force Quit panels
+            # opened later - those must always make the lock step aside)
+            self._lw_startup = window_owner_numbers()
             global FONT
             try:
                 FONT = tkfont.nametofont("TkDefaultFont").actual("family")   # San Francisco
@@ -3219,7 +3295,8 @@ class FocusLock(tk.Tk):
                     padx=10, pady=3).pack(side="right", pady=(px(10), 0))
         self.app_list = CheckList(cr, colw, px(150))
         self.app_list.pack(fill="x")
-        label(cr, "Other apps (exe names, comma separated)", 9, SUBTLE).pack(
+        label(cr, "Other apps (%s, comma separated)" % (
+            "app names" if IS_MAC else "exe names"), 9, SUBTLE).pack(
             anchor="w", pady=(px(8), px(4)))
         self.extra_var = tk.StringVar(value=s["extra"])
         RoundEntry(cr, self.extra_var, colw, size=10).pack(fill="x")
@@ -3314,6 +3391,8 @@ class FocusLock(tk.Tk):
     def update_ext_status(self, token):
         if token is not self._status_token or self.phase not in ("setup", "starting"):
             return
+        if IS_MAC and not _spotify.asked and self.spotify_var.get():
+            spotify_state()       # macOS asks "control Spotify?" now, while nothing covers it
         try:
             color, text, fixable = self.ext_state()
             d = px(10)
@@ -3347,15 +3426,29 @@ class FocusLock(tk.Tk):
             messagebox.showerror(APP_TITLE, "Couldn't write the extension files:\n%s" % e)
             return
         self.tabsrv.ext_version = EXT_VERSION
-        open_folder(folder)
+        if IS_MAC:
+            # ~/Library is hidden in Chrome's folder dialog: show the folder selected in
+            # Finder and put its path on the clipboard for Cmd+Shift+G.
+            try:
+                subprocess.Popen(["/usr/bin/open", "-R", folder])
+            except OSError:
+                pass
+            self.clipboard_clear()
+            self.clipboard_append(folder)
+            step2 = ("2. Click 'Load unpacked'. In the dialog press Cmd+Shift+G, paste (Cmd+V - "
+                     "the folder path is already copied), press Return, then click Select.\n"
+                     "   (Or drag the selected 'extension' folder from Finder onto the "
+                     "Chrome page.)\n")
+        else:
+            open_folder(folder)
+            step2 = ("2. Click 'Load unpacked' and choose the folder that just opened in "
+                     "Explorer:\n    " + folder + "\n")
         open_in_chrome("chrome://extensions")
         messagebox.showinfo(
             "Install the Focus Lock extension",
             "Do this once (about 30 seconds):\n\n"
             "1. In the Chrome page that just opened, switch ON 'Developer mode' "
-            "(top-right).\n"
-            "2. Click 'Load unpacked' and choose the folder that just opened in "
-            "%s:\n    " % ("Finder" if IS_MAC else "Explorer") + folder + "\n"
+            "(top-right).\n" + step2 +
             "   (Already installed? Just click the reload arrow on Focus Lock.)\n"
             "3. Click 'Details' on Focus Lock and switch ON 'Allow in Incognito'. "
             "This is required - otherwise a private window would get around the lock.\n"
@@ -3428,6 +3521,8 @@ class FocusLock(tk.Tk):
         st = self.tabsrv.status
         if st.get("locked"):
             params["allowed"].add(CHROME_KEY)
+            if IS_MAC:
+                params["allowed"] |= CHROME_BUNDLES
             self.begin_session(params)
             return
         if st.get("error"):
@@ -3561,7 +3656,8 @@ class FocusLock(tk.Tk):
         RoundButton(btns, "End early", self.show_quit_prompt, kind="ghost", size=10,
                     hover_fg=DANGER, padx=18, pady=9).pack(side="left")
         if self.spotify_on:
-            self.spotify_card = SpotifyCard(self.actions, self.spotify, px(300), px(108))
+            self.spotify_card = SpotifyCard(self.actions, self.spotify, px(300), px(108),
+                                            can_open_settings=not IS_MAC)
             self.spotify_card.pack(pady=(px(22), 0))
         self.exit_frame = tk.Frame(center, bg=BG)
         self.exit_frame.pack()
@@ -3598,11 +3694,18 @@ class FocusLock(tk.Tk):
             win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "plain", "none")
         except tk.TclError:
             pass
+        if tk.TkVersion >= 9:    # Tk 9 creates every window titled; this makes it borderless
+            try:
+                win.tk.call("wm", "attributes", win._w, "-stylemask", "")
+            except tk.TclError:
+                pass
         win.title(APP_TITLE + " lock")
         win.configure(bg=BG)
         win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", lambda: None)
         self.lock_win = win
+        self._lock_rect = (x, y, w, h)
         self.container = tk.Frame(win, bg=BG)
         self.container.pack(expand=True, fill="both")
         self.withdraw()
@@ -3611,9 +3714,9 @@ class FocusLock(tk.Tk):
         """Once the lock windows are on screen: kiosk mode + raise them above everything."""
         if gen != self.gen or self.lock_win is None:
             return
-        self._lock_baseline = window_owner_numbers()       # loginwindow windows already up
+        self._lock_baseline = self._lw_startup & window_owner_numbers()
         for w in [self.lock_win] + self.covers:
-            set_window_level(w, LEVEL_LOCK, CB_EVERYWHERE, can_hide=False)
+            set_window_level(w, LEVEL_LOCK, CB_EVERYWHERE, can_hide=False, movable=False)
         activate_self()
         try:
             set_presentation(LOCK_OPTIONS)
@@ -3662,7 +3765,7 @@ class FocusLock(tk.Tk):
         if self.tab_locked:
             if self.ext_outdated():
                 text, color = "●  Reload the Focus Lock extension", WARN
-            elif time.time() - self.tabsrv.status_at < 6:
+            elif time.monotonic() - self.tabsrv.status_at < 6:
                 text, color = "●  Chrome tab locked", GOOD
             else:
                 text, color = "●  Waiting for Chrome...", WARN
@@ -3802,8 +3905,10 @@ class FocusLock(tk.Tk):
         if gen != self.gen:
             return
         if IS_MAC:
-            self._mac_keep_lock()
-            self.after(250, self.keep_focus, gen)
+            try:
+                self._mac_keep_lock()
+            finally:
+                self.after(250, self.keep_focus, gen)
             return
         windows = [self] + self.covers
         if foreground_exe() in ESCAPE_APPS:
@@ -3823,15 +3928,22 @@ class FocusLock(tk.Tk):
         if self.lock_win is None or not self._lock_armed:
             return
         windows = [self.lock_win] + self.covers
-        pid, bundle, name = frontmost_app()
-        force_quit = bool(window_owner_numbers() - self._lock_baseline)
-        if force_quit or name in ESCAPE_APPS or bundle == "com.apple.securityagent":
-            for w in windows:                      # step aside so you can end us
-                set_window_level(w, LEVEL_NORMAL)
+        pid, bundle, _name = frontmost_app()
+        current = window_owner_numbers()
+        self._lock_baseline &= current             # a closed-then-reopened panel counts as new
+        force_quit = bool(current - self._lock_baseline)
+        escape = bundle in MAC_ESCAPE_BUNDLES
+        if self.lock_win.state() != "normal":      # e.g. minimised: put it back
+            self.lock_win.deiconify()
+        x, y, w, h = self._lock_rect
+        want = "%dx%d+%d+%d" % (w, h, x, y)
+        if self.lock_win.geometry() != want:       # dragged or resized: snap it back
+            self.lock_win.geometry(want)
+        for win in windows:                        # step aside so you can end us
+            set_window_level(win, LEVEL_NORMAL if (force_quit or escape) else LEVEL_LOCK)
+        if escape or force_quit:                   # never take focus from Force Quit
             return
-        for w in windows:
-            set_window_level(w, LEVEL_LOCK)
-        if pid != os.getpid():                     # something else got activated: take it back
+        if pid is not None and pid != os.getpid():  # something else got activated: take it back
             activate_self()
             target = self.quit_entry if self.quit_entry is not None else self.lock_win
             try:
@@ -3845,7 +3957,7 @@ class FocusLock(tk.Tk):
             return
         chrome_visible = False
         if IS_MAC:
-            hide_disallowed(self.allowed)      # Chrome running != tab alive on a Mac (see below)
+            chrome_visible = hide_disallowed(self.allowed)   # = Chrome is running
         else:
             for hwnd, _pid, exe, _title in list_app_windows(exclude_pids={os.getpid()}):
                 if exe == CHROME_KEY:
@@ -3865,12 +3977,18 @@ class FocusLock(tk.Tk):
         """If Chrome was closed entirely (so the extension can't react), reopen the page.
         On a Mac, Chrome keeps running after its last window closes but unloads the
         extension, so a silent extension is enough reason to reopen the page."""
-        if not (self.tab_locked and self.tabsrv.locked_url) or (chrome_visible and not IS_MAC):
+        if not (self.tab_locked and self.tabsrv.locked_url):
             return
         now = time.monotonic()
-        if time.time() - self.tabsrv.status_at < 8 or now - self._last_relaunch < 10:
+        if now - self.tabsrv.status_at < 8:
+            self._revived = False                  # extension is talking again
+            return
+        if chrome_visible and (not IS_MAC or self._revived):
+            return       # Mac: one try per silence, or a removed extension means endless tabs
+        if now - self._last_relaunch < 10:
             return
         self._last_relaunch = now
+        self._revived = True
         open_in_chrome(self.tabsrv.locked_url)
 
     # ---- ending ------------------------------------------------------------
@@ -4047,6 +4165,9 @@ def run_checks():
     if IS_MAC and tk.TkVersion < 8.6:
         report(False, "Tk version", "Tk 8.6+ needed - install Python from python.org")
         return
+    if IS_MAC and root.tk.call("tk", "windowingsystem") != "aqua":
+        report(False, "Tk windowing system", "X11 Tk - install Python from python.org")
+        return
     root.title("Focus Lock check")
     root.configure(bg=BG)
     tk.Label(root, text="Checking...  (the Dock and menu bar disappear for 2 seconds)",
@@ -4080,6 +4201,8 @@ def run_checks():
         def lock_window():
             win = tk.Toplevel(root)
             win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "plain", "none")
+            if tk.TkVersion >= 9:
+                win.tk.call("wm", "attributes", win._w, "-stylemask", "")
             win.configure(bg=BG)
             win.geometry("420x140+120+120")
             var = tk.StringVar()
@@ -4091,6 +4214,7 @@ def run_checks():
             e.focus_force()
             wait(root, 0.4)
             report(ok_level, "Lock window found and raised above the menu bar")
+            report(not has_title_bar(win), "Lock window has no title bar (can't be dragged)")
             report(win.focus_get() is e, "Lock window accepts typing (quit phrase)")
             win.destroy()
         step("Lock window", lock_window)
